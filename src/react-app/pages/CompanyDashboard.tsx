@@ -602,8 +602,8 @@ export default function CompanyDashboard() {
               {monthlyData.length > 0 && (
                 <div className="bg-white/5 backdrop-blur-md rounded-lg border border-white/10 p-6">
                   <h4 className="text-white font-medium mb-4">Performance Mensal (Últimos 6 Meses)</h4>
-                  <div className="h-80">
-                    <ResponsiveContainer width="100%" height="100%">
+                  <div className="h-80" style={{ minWidth: 0 }}>
+                    <ResponsiveContainer width="100%" aspect={2}>
                       <BarChart data={monthlyData}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#ffffff20" />
                         <XAxis 
@@ -645,13 +645,13 @@ export default function CompanyDashboard() {
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <div className="bg-white/5 backdrop-blur-md rounded-lg border border-white/10 p-6">
                   <h4 className="text-white font-medium mb-4">Evolução de Vendas</h4>
-                  <div className="h-64">
-                    <ResponsiveContainer width="100%" height="100%">
+                  <div className="h-64" style={{ minWidth: 0 }}>
+                    <ResponsiveContainer width="100%" aspect={2}>
                       <LineChart data={monthlyData.length > 0 ? monthlyData : [{
                         month: 'Atual',
                         sales_value: stats.monthly.sales_value,
                         sales_count: stats.monthly.sales_count
-                      }]}>
+                      }]}> 
                         <CartesianGrid strokeDasharray="3 3" stroke="#ffffff20" />
                         <XAxis 
                           dataKey="month" 
@@ -683,8 +683,8 @@ export default function CompanyDashboard() {
 
                 <div className="bg-white/5 backdrop-blur-md rounded-lg border border-white/10 p-6">
                   <h4 className="text-white font-medium mb-4">Distribuição de Valores</h4>
-                  <div className="h-64">
-                    <ResponsiveContainer width="100%" height="100%">
+                  <div className="h-64" style={{ minWidth: 0 }}>
+                    <ResponsiveContainer width="100%" aspect={2}>
                       <PieChart>
                         <Pie
                           data={[

@@ -3,31 +3,7 @@ import { ArrowRight, Users, TrendingUp, Shield, Smartphone, DollarSign, Store } 
 import { useEffect } from 'react';
 
 export default function Home() {
-  useEffect(() => {
-    // Testar conexão com Supabase
-    const testConnection = async () => {
-      try {
-        const { supabase } = await import('../../lib/supabase')
-        console.log('🧪 Testando conexão com Supabase...')
-        
-        const { data, error } = await supabase
-          .from('user_profiles')
-          .select('*')
-          .limit(1)
-        
-        if (error) {
-          console.error('❌ Erro na conexão:', error.message)
-        } else {
-          console.log('✅ Conexão estabelecida com sucesso!')
-          console.log('📊 Dados:', data)
-        }
-      } catch (err) {
-        console.error('❌ Erro ao testar:', err)
-      }
-    }
-    
-    testConnection()
-  }, [])
+  useEffect(() => {}, [])
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#001144] to-[#000011]">
@@ -44,35 +20,6 @@ export default function Home() {
             </div>
 
             <div className="flex items-center space-x-4">
-              <button
-                onClick={async () => {
-                  try {
-                    const { supabase } = await import('../../lib/supabase')
-                    console.log('🧪 Testando conexão com Supabase...')
-                    
-                    const { data, error } = await supabase
-                      .from('user_profiles')
-                      .select('*')
-                      .limit(1)
-                    
-                    if (error) {
-                      console.error('❌ Erro na conexão:', error.message)
-                      alert('❌ Erro na conexão: ' + error.message)
-                    } else {
-                      console.log('✅ Conexão estabelecida com sucesso!')
-                      console.log('📊 Dados:', data)
-                      alert('✅ Conexão estabelecida com sucesso! Verifique o console para mais detalhes.')
-                    }
-                  } catch (err) {
-                    console.error('❌ Erro ao testar:', err)
-                    alert('❌ Erro ao testar: ' + (err as Error).message)
-                  }
-                }}
-                className="inline-flex items-center px-4 py-2 bg-blue-500 text-white rounded-lg font-semibold hover:bg-blue-600 hover:scale-[1.02] transition-all duration-200 text-sm"
-              >
-                🧪 Testar Supabase
-              </button>
-              
               <Link
                 to="/empresa/cadastro"
                 className="hidden sm:inline-flex items-center px-4 py-2 bg-white/10 backdrop-blur-md border border-[#70ff00] text-[#70ff00] rounded-lg font-semibold hover:bg-[#70ff00] hover:text-white hover:scale-[1.02] transition-all duration-200 text-sm"

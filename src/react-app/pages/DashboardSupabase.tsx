@@ -8,9 +8,9 @@ import { Wallet, Users, TrendingUp, Settings, Copy, Share2, MessageCircle } from
 function Dashboard() {
   const navigate = useNavigate();
   const { user: affiliateUser, loading: authLoading } = useAffiliateAuth();
-  const { balance, loading: balanceLoading } = useAffiliateBalance(affiliateUser?.cpf || '');
+  const { balance, loading: balanceLoading } = useAffiliateBalance(affiliateUser?.id?.toString() || '');
   const { transactions, loading: transactionsLoading } = useAffiliateTransactions(affiliateUser?.cpf || '', 10);
-  const { network, loading: networkLoading } = useNetworkMembers(affiliateUser?.cpf || '');
+  const { network, loading: networkLoading } = useNetworkMembers(affiliateUser?.id?.toString() || '');
   
   const [copyMessage, setCopyMessage] = useState<string>('');
   const [couponCopyMessage, setCouponCopyMessage] = useState<string>('');
@@ -210,7 +210,7 @@ ${referralLink}
             </div>
             <h3 className="text-white/60 text-sm mb-1">Disponível para saque</h3>
             <p className="text-2xl font-bold text-[#70ff00]">
-              R$ {balance?.available_balance?.toFixed(2) || '0.00'}
+              R$ {Number(balance?.available_balance || 0).toFixed(2)}
             </p>
             <button
               onClick={() => navigate('/saque')}
@@ -228,7 +228,7 @@ ${referralLink}
             </div>
             <h3 className="text-white/60 text-sm mb-1">Total ganho</h3>
             <p className="text-2xl font-bold text-[#70ff00]">
-              R$ {balance?.total_earned?.toFixed(2) || '0.00'}
+              R$ {Number(balance?.total_earned || 0).toFixed(2)}
             </p>
             <div className="mt-3 text-xs text-[#70ff00]/60">
               Desde {new Date(affiliateUser.created_at).toLocaleDateString('pt-BR')}
@@ -243,10 +243,10 @@ ${referralLink}
             </div>
             <h3 className="text-white/60 text-sm mb-1">Indicados ativos</h3>
             <p className="text-2xl font-bold text-[#70ff00]">
-              {network.level1.length + network.level2.length + network.level3.length}
+              {(network.level1?.length || 0) + (network.level2?.length || 0) + (network.level3?.length || 0)}
             </p>
             <div className="mt-3 text-xs text-[#70ff00]/60">
-              N1: {network.level1.length} | N2: {network.level2.length} | N3: {network.level3.length}
+              N1: {network.level1?.length || 0} | N2: {network.level2?.length || 0} | N3: {network.level3?.length || 0}
             </div>
           </div>
 

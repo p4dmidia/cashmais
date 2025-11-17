@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import bcrypt from "bcryptjs";
+import { createClient } from '@supabase/supabase-js'
 // Using Web Crypto API for Cloudflare Workers
 import { z } from "zod";
 import { distributeNetworkCommissions } from "./commission-utils";
@@ -313,38 +314,111 @@ app.post('/api/empresa/caixas', async (c) => {
   }
 
   try {
-    const { name, cpf, password } = CreateCashierSchema.parse(await c.req.json());
+    const body = await c.req.json();
+    const parsed = CreateCashierSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: 'Dados inválidos', details: parsed.error.errors }, 400);
+    }
+    const { name, cpf, password } = parsed.data;
+    const cleanCpf = cpf.replace(/\D/g, '');
 
     // Check if CPF already exists for this company
     const existing = await c.env.DB.prepare(`
       SELECT id FROM company_cashiers WHERE company_id = ? AND cpf = ?
-    `).bind(session.id, cpf).first();
+    `).bind(session.id, cleanCpf).first();
     
     if (existing) {
       return c.json({ error: 'CPF já cadastrado para esta empresa' }, 400);
     }
 
+    // Prevent CPF already linked to another company
+    const globalExisting = await c.env.DB.prepare(`
+      SELECT company_id FROM company_cashiers WHERE cpf = ?
+    `).bind(cleanCpf).first();
+    if (globalExisting && (globalExisting as any).company_id !== session.id) {
+      return c.json({ error: 'CPF já vinculado a outra empresa' }, 409);
+    }
+
     // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Create user_profile entry for the cashier to satisfy foreign key constraint
+    let existingProfile = await c.env.DB.prepare(`
+      SELECT id FROM user_profiles WHERE cpf = ?
+    `).bind(cleanCpf).first();
+
+    let userProfileId: number;
+    if (existingProfile && (existingProfile as any).id) {
+      userProfileId = (existingProfile as any).id as number;
+    } else {
     const userProfileResult = await c.env.DB.prepare(`
       INSERT INTO user_profiles (mocha_user_id, cpf, role, is_active)
       VALUES (?, ?, 'cashier', 1)
     `).bind(`cashier_${cleanCpf}_${Date.now()}`, cleanCpf).run();
+    userProfileId = userProfileResult.meta.last_row_id as number;
+    }
 
-    const userProfileId = userProfileResult.meta.last_row_id;
+    // Supabase-only creation (no local DB write)
+    const supabase = createSupabaseClient(c);
 
-    // Create cashier
-    await c.env.DB.prepare(`
-      INSERT INTO company_cashiers (company_id, user_id, name, cpf, password_hash)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(session.id, userProfileId, name, cleanCpf, passwordHash).run();
+    const { data: existingSup } = await supabase
+      .from('company_cashiers')
+      .select('id')
+      .eq('company_id', session.id)
+      .eq('cpf', cleanCpf)
+      .single();
+    if (existingSup) {
+      return c.json({ error: 'CPF já cadastrado para esta empresa' }, 400);
+    }
+    // Prevent CPF linked to another company
+    const { data: globalExisting } = await supabase
+      .from('company_cashiers')
+      .select('company_id')
+      .eq('cpf', cleanCpf)
+      .single();
+    if (globalExisting && globalExisting.company_id !== session.id) {
+      return c.json({ error: 'CPF já vinculado a outra empresa' }, 409);
+    }
+
+    let { data: supProfile } = await supabase
+      .from('user_profiles')
+      .select('id')
+      .eq('cpf', cleanCpf)
+      .single();
+    if (!supProfile) {
+      const { data: createdSupProfile, error: profileError } = await supabase
+        .from('user_profiles')
+        .insert({
+          mocha_user_id: `cashier_${cleanCpf}_${Date.now()}`,
+          cpf: cleanCpf,
+          role: 'cashier',
+          is_active: true
+        })
+        .select()
+        .single();
+      if (profileError || !createdSupProfile) {
+        return c.json({ error: 'Erro interno do servidor', detail: String(profileError?.message || profileError) }, 500);
+      }
+      supProfile = createdSupProfile as any;
+    }
+
+    const { error: cashierError } = await supabase
+      .from('company_cashiers')
+      .insert({
+        company_id: session.id,
+        user_id: (supProfile as any).id,
+        name,
+        cpf: cleanCpf,
+        password_hash: passwordHash,
+        is_active: true
+      });
+    if (cashierError) {
+      return c.json({ error: 'Erro interno do servidor', detail: String(cashierError?.message || cashierError) }, 500);
+    }
 
     return c.json({ success: true, message: 'Caixa cadastrado com sucesso!' });
   } catch (error: any) {
     console.error('Create cashier error:', error);
-    return c.json({ error: 'Erro interno do servidor' }, 500);
+    return c.json({ error: 'Erro interno do servidor', detail: String(error?.message || error) }, 500);
   }
 });
 
@@ -356,14 +430,22 @@ app.get('/api/empresa/caixas', async (c) => {
   }
 
   try {
-    const cashiers = await c.env.DB.prepare(`
-      SELECT id, name, cpf, is_active, last_access_at, created_at
-      FROM company_cashiers
-      WHERE company_id = ?
-      ORDER BY created_at DESC
-    `).bind(session.id).all();
-
-    return c.json({ cashiers: cashiers.results });
+    const supabase = createSupabaseClient(c);
+    const { data: cashiers, error } = await supabase
+      .from('company_cashiers')
+      .select('id, name, cpf, is_active, last_access_at, created_at')
+      .eq('company_id', session.id)
+      .order('created_at', { ascending: false });
+    if (error) {
+      const local = await c.env.DB.prepare(`
+        SELECT id, name, cpf, is_active, last_access_at, created_at
+        FROM company_cashiers
+        WHERE company_id = ?
+        ORDER BY created_at DESC
+      `).bind(session.id).all();
+      return c.json({ cashiers: local.results });
+    }
+    return c.json({ cashiers });
   } catch (error: any) {
     console.error('List cashiers error:', error);
     return c.json({ error: 'Erro interno do servidor' }, 500);
@@ -826,3 +908,9 @@ app.post('/api/caixa/logout', async (c) => {
 });
 
 export default app;
+function createSupabaseClient(c: any) {
+  return createClient(
+    c.env.SUPABASE_URL,
+    c.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+}

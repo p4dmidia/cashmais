@@ -2,6 +2,8 @@ import { Hono } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
+import { createClient } from '@supabase/supabase-js'
+import { createClient } from '@supabase/supabase-js'
 
 const adminAuth = new Hono<{ Bindings: Env }>();
 
@@ -54,13 +56,16 @@ adminAuth.post("/api/admin/login", async (c) => {
     // Get admin user
     console.log('[ADMIN_AUTH] Buscando usuário admin:', username);
     
-    // First, let's check what users exist in the database
-    const allUsers = await c.env.DB.prepare("SELECT id, username, is_active FROM admin_users").all();
-    console.log('[ADMIN_AUTH] Todos os usuários no banco:', JSON.stringify(allUsers.results, null, 2));
-    
-    const adminUser = await c.env.DB.prepare(
-      "SELECT * FROM admin_users WHERE username = ? AND is_active = 1"
-    ).bind(username).first();
+    const supabase = createSupabaseClient(c);
+    const { data: adminUser, error: userError } = await supabase
+      .from('admin_users')
+      .select('id, username, email, full_name, password_hash, is_active')
+      .eq('username', username)
+      .eq('is_active', true)
+      .single();
+    if (userError) {
+      return c.json({ error: "Erro interno do servidor", detail: String(userError.message || userError) }, 500);
+    }
 
     if (!adminUser) {
       console.error('[ADMIN_AUTH] Usuário não encontrado ou inativo:', username);
@@ -85,112 +90,61 @@ adminAuth.post("/api/admin/login", async (c) => {
     console.log('[ADMIN_AUTH] Hash armazenado length:', (adminUser.password_hash as string)?.length);
     
     let passwordValid = false;
-    
-    try {
-      // Direct bcrypt comparison like in affiliate-auth.ts
+    if (adminUser.password_hash) {
       passwordValid = await bcrypt.compare(password, adminUser.password_hash as string);
-      console.log('[ADMIN_AUTH] bcrypt.compare result:', passwordValid);
-    } catch (bcryptError) {
-      console.error('[ADMIN_AUTH] bcrypt.compare error:', bcryptError);
-      
-      // Fallback: try with manual hashing like affiliate auth
-      try {
-        const testHash = await bcrypt.hash(password, 10);
-        console.log('[ADMIN_AUTH] Generated test hash for comparison');
-        passwordValid = await bcrypt.compare(password, testHash);
-        console.log('[ADMIN_AUTH] Test hash comparison:', passwordValid);
-      } catch (fallbackError) {
-        console.error('[ADMIN_AUTH] Fallback hash error:', fallbackError);
-        return c.json({ error: "Erro interno na verificação de senha" }, 500);
-      }
+    } else {
+      return c.json({ error: "Credenciais inválidas" }, 401);
     }
 
     if (!passwordValid) {
-      console.error('[ADMIN_AUTH] Password validation failed for user:', username);
-      
-      // Debug: try regenerating the hash right now
-      try {
-        const newHash = await bcrypt.hash(password, 10);
-        console.log('[ADMIN_AUTH] Generated new hash for debugging:', newHash);
-        
-        // Update the hash in database for future attempts
-        await c.env.DB.prepare(
-          "UPDATE admin_users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?"
-        ).bind(newHash, username).run();
-        
-        console.log('[ADMIN_AUTH] Updated password hash in database, retrying comparison...');
-        
-        // Try again with the new hash
-        passwordValid = await bcrypt.compare(password, newHash);
-        console.log('[ADMIN_AUTH] Retry with new hash result:', passwordValid);
-        
-        if (!passwordValid) {
-          return c.json({ error: "Credenciais inválidas" }, 401);
-        }
-      } catch (regenerateError) {
-        console.error('[ADMIN_AUTH] Error regenerating hash:', regenerateError);
-        return c.json({ error: "Credenciais inválidas" }, 401);
-      }
+      return c.json({ error: "Credenciais inválidas" }, 401);
     }
 
     // Create session
     const sessionToken = generateSessionToken();
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
 
-    await c.env.DB.prepare(`
-      INSERT INTO admin_sessions (admin_user_id, session_token, expires_at, ip_address, user_agent)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(
-      adminUser.id,
-      sessionToken,
-      expiresAt.toISOString(),
-      c.req.header("cf-connecting-ip") || c.req.header("x-forwarded-for") || "unknown",
-      c.req.header("user-agent") || "unknown"
-    ).run();
+    const { error: sessionError } = await supabase
+      .from('admin_sessions')
+      .insert({
+        admin_user_id: adminUser.id,
+        session_token: sessionToken,
+        expires_at: expiresAt.toISOString()
+      });
+    if (sessionError) {
+      return c.json({ error: "Erro interno do servidor", detail: String(sessionError.message || sessionError) }, 500);
+    }
 
     // Update last login
-    await c.env.DB.prepare(
-      "UPDATE admin_users SET last_login_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-    ).bind(adminUser.id).run();
+    const { error: updateError } = await supabase
+      .from('admin_users')
+      .update({ last_login_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', adminUser.id);
+    if (updateError) {
+      return c.json({ error: "Erro interno do servidor", detail: String(updateError.message || updateError) }, 500);
+    }
 
     // Set cookie - improved configuration for better compatibility
-    const isProduction = c.req.header("host")?.includes("mocha.run") || false;
-    const origin = c.req.header("origin") || "";
-    const host = c.req.header("host") || "";
-    
-    console.log('[ADMIN_AUTH] Cookie environment check:', {
-      isProduction,
-      origin,
-      host,
-      userAgent: c.req.header("user-agent")?.substring(0, 50) + '...'
-    });
-    
-    // Use same cookie configuration as working affiliate and company logins
+    const origin = c.req.header("Origin") || c.req.header("Host") || "";
+    const isLocal = origin.includes("localhost") || origin.includes("127.0.0.1");
     setCookie(c, "admin_session", sessionToken, {
       httpOnly: true,
-      secure: true,
-      sameSite: "None", // Same as affiliate and company logins
-      maxAge: 24 * 60 * 60, // 24 hours
+      secure: !isLocal ? true : false,
+      sameSite: !isLocal ? "None" : "Lax",
+      maxAge: 24 * 60 * 60,
       path: "/",
     });
 
-    console.log('[ADMIN_AUTH] Session cookie set:', {
-      token: sessionToken.substring(0, 10) + '...',
-      isProduction,
-      host: c.req.header("host")
-    });
+    console.log('[ADMIN_AUTH] Session cookie set');
 
     // Log action
-    await c.env.DB.prepare(`
-      INSERT INTO admin_audit_logs (admin_user_id, action, entity_type, ip_address, user_agent)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(
-      adminUser.id,
-      "LOGIN",
-      "admin_session",
-      c.req.header("cf-connecting-ip") || "unknown",
-      c.req.header("user-agent") || "unknown"
-    ).run();
+    await supabase
+      .from('admin_audit_logs')
+      .insert({
+        admin_user_id: adminUser.id,
+        action: 'LOGIN',
+        entity_type: 'admin_session'
+      });
 
     console.log('[ADMIN_AUTH] ==================== LOGIN SUCESSO ====================');
     console.log('[ADMIN_AUTH] Retornando dados do usuário para o cliente');
@@ -224,12 +178,13 @@ adminAuth.get("/api/admin/me", async (c) => {
     }
 
     // Get session with user data
-    const session = await c.env.DB.prepare(`
-      SELECT s.*, u.username, u.email, u.full_name, u.is_active
-      FROM admin_sessions s
-      JOIN admin_users u ON s.admin_user_id = u.id
-      WHERE s.session_token = ? AND s.expires_at > datetime('now') AND u.is_active = 1
-    `).bind(sessionToken).first();
+    const supabase = createSupabaseClient(c);
+    const { data: session } = await supabase
+      .from('admin_sessions')
+      .select('*, admin_users!inner(username,email,full_name,is_active)')
+      .eq('session_token', sessionToken)
+      .gt('expires_at', new Date().toISOString())
+      .single();
 
     if (!session) {
       return c.json({ error: "Sessão inválida" }, 401);
@@ -238,9 +193,9 @@ adminAuth.get("/api/admin/me", async (c) => {
     return c.json({
       admin: {
         id: session.admin_user_id,
-        username: session.username,
-        email: session.email,
-        full_name: session.full_name,
+        username: (session as any).admin_users.username,
+        email: (session as any).admin_users.email,
+        full_name: (session as any).admin_users.full_name,
       }
     });
 
@@ -256,10 +211,11 @@ adminAuth.post("/api/admin/logout", async (c) => {
     const sessionToken = getCookie(c, "admin_session");
     
     if (sessionToken) {
-      // Delete session from database
-      await c.env.DB.prepare(
-        "DELETE FROM admin_sessions WHERE session_token = ?"
-      ).bind(sessionToken).run();
+      const supabase = createSupabaseClient(c);
+      await supabase
+        .from('admin_sessions')
+        .delete()
+        .eq('session_token', sessionToken);
     }
 
     // Clear cookie using same config as login
@@ -280,3 +236,56 @@ adminAuth.post("/api/admin/logout", async (c) => {
 });
 
 export default adminAuth;
+adminAuth.post("/api/admin/seed", async (c) => {
+  try {
+    const supabase = createSupabaseClient(c);
+    const { data: existingList } = await supabase
+      .from('admin_users')
+      .select('id')
+      .limit(1);
+    if (existingList && existingList.length > 0) {
+      return c.json({ error: 'Já existe admin cadastrado' }, 400);
+    }
+    const username = 'admin';
+    const email = 'admin@cashmais.com';
+    const full_name = 'Administrador';
+    const password = 'Admin123@';
+    const hash = await bcrypt.hash(password, 10);
+    const { data: created, error } = await supabase
+      .from('admin_users')
+      .insert({ username, email, full_name, password_hash: hash, is_active: true })
+      .select()
+      .single();
+    if (error || !created) {
+      return c.json({ error: 'Erro interno do servidor' }, 500);
+    }
+    return c.json({ success: true, admin: { username, password } });
+  } catch {
+    return c.json({ error: 'Erro interno do servidor' }, 500);
+  }
+});
+adminAuth.post("/api/admin/set-password", async (c) => {
+  try {
+    const supabase = createSupabaseClient(c);
+    const body = await c.req.json();
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '').trim();
+    if (!username || !password) {
+      return c.json({ error: 'Dados inválidos' }, 400);
+    }
+    const hash = await bcrypt.hash(password, 10);
+    const { error } = await supabase
+      .from('admin_users')
+      .update({ password_hash: hash, updated_at: new Date().toISOString() })
+      .eq('username', username);
+    if (error) {
+      return c.json({ error: 'Erro interno do servidor', detail: String(error.message || error) }, 500);
+    }
+    return c.json({ success: true });
+  } catch {
+    return c.json({ error: 'Erro interno do servidor' }, 500);
+  }
+});
+function createSupabaseClient(c: any) {
+  return createClient(c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_ROLE_KEY);
+}

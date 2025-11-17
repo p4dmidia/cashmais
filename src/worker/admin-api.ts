@@ -1,9 +1,14 @@
 import { Hono } from "hono";
 import { getCookie } from "hono/cookie";
+import { createClient } from '@supabase/supabase-js'
 import { z } from "zod";
 import { validateCommissionSettings } from "./commission-utils";
 
 const adminApi = new Hono<{ Bindings: Env }>();
+
+function createSupabaseClient(c: any) {
+  return createClient(c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_ROLE_KEY);
+}
 
 // Middleware para verificar autenticação admin
 async function requireAdminAuth(c: any, next: any) {
@@ -34,19 +39,20 @@ async function requireAdminAuth(c: any, next: any) {
   }
 
   try {
-    const session = await c.env.DB.prepare(`
-      SELECT s.admin_user_id, u.username, u.full_name
-      FROM admin_sessions s
-      JOIN admin_users u ON s.admin_user_id = u.id
-      WHERE s.session_token = ? AND s.expires_at > datetime('now') AND u.is_active = 1
-    `).bind(sessionToken).first();
+    const supabase = createSupabaseClient(c);
+    const { data: session } = await supabase
+      .from('admin_sessions')
+      .select('admin_user_id, admin_users!inner(username, full_name, is_active)')
+      .eq('session_token', sessionToken)
+      .gt('expires_at', new Date().toISOString())
+      .single();
 
     if (!session) {
       console.log('[ADMIN_AUTH_MIDDLEWARE] Invalid or expired session');
       return c.json({ error: "Sessão inválida" }, 401);
     }
 
-    console.log('[ADMIN_AUTH_MIDDLEWARE] Valid session found for user:', session.username);
+    console.log('[ADMIN_AUTH_MIDDLEWARE] Valid session found for user:', (session as any).admin_users.username);
     (c as any).set("adminUser", session);
     await next();
   } catch (error) {
@@ -59,18 +65,16 @@ async function requireAdminAuth(c: any, next: any) {
 adminApi.get("/api/admin/me", requireAdminAuth, async (c) => {
   try {
     const adminUser: any = (c as any).get("adminUser");
-    
-    const fullAdminData = await c.env.DB.prepare(
-      "SELECT id, username, email, full_name, is_active, last_login_at, created_at FROM admin_users WHERE id = ?"
-    ).bind(adminUser.admin_user_id).first();
-
-    if (!fullAdminData) {
+    const supabase = createSupabaseClient(c);
+    const { data: fullAdminData, error } = await supabase
+      .from('admin_users')
+      .select('id, username, email, full_name, is_active, last_login_at, created_at')
+      .eq('id', (adminUser as any).admin_user_id)
+      .single();
+    if (error || !fullAdminData) {
       return c.json({ error: "Usuário não encontrado" }, 404);
     }
-
-    return c.json({
-      admin: fullAdminData
-    });
+    return c.json({ admin: fullAdminData });
   } catch (error) {
     console.error("Get admin user error:", error);
     return c.json({ error: "Erro interno do servidor" }, 500);
@@ -80,61 +84,55 @@ adminApi.get("/api/admin/me", requireAdminAuth, async (c) => {
 // Dashboard stats
 adminApi.get("/api/admin/dashboard/stats", requireAdminAuth, async (c) => {
   try {
-    // Total affiliates (all active)
-    const totalAffiliatesResult = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM affiliates WHERE is_active = 1"
-    ).first();
-    const totalAffiliates = (totalAffiliatesResult?.count as number) || 0;
+    const supabase = createSupabaseClient(c);
+    const { count: totalAffiliates } = await supabase
+      .from('affiliates')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_active', true);
 
-    // Total active companies
-    const totalCompaniesResult = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM companies WHERE is_active = 1"
-    ).first();
-    const totalCompanies = (totalCompaniesResult?.count as number) || 0;
+    const { count: totalCompanies } = await supabase
+      .from('companies')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_active', true);
 
-    // Pending withdrawals - count and total amount
-    const pendingWithdrawalsResult = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count, COALESCE(SUM(amount_requested), 0) as total_amount FROM withdrawals WHERE status = 'pending'"
-    ).first();
-    const pendingCount = (pendingWithdrawalsResult?.count as number) || 0;
-    const pendingAmount = (pendingWithdrawalsResult?.total_amount as number) || 0;
+    const { data: pendingWithdrawals } = await supabase
+      .from('withdrawals')
+      .select('amount_requested')
+      .eq('status', 'pending');
+    const pendingCount = (pendingWithdrawals || []).length;
+    const pendingAmount = (pendingWithdrawals || []).reduce((sum: number, w: any) => sum + Number(w.amount_requested || 0), 0);
 
-    // Get current month in format YYYY-MM
     const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const thisMonth = `${year}-${month}`;
+    const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+    const nextMonthStart = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString().split('T')[0];
+    const { data: monthRows } = await supabase
+      .from('company_purchases')
+      .select('cashback_generated, purchase_date')
+      .gte('purchase_date', monthStart)
+      .lt('purchase_date', nextMonthStart);
+    const cashbackThisMonth = (monthRows || []).reduce((sum: number, r: any) => sum + Number(r.cashback_generated || 0), 0);
 
-    // Total cashback generated this month
-    const cashbackThisMonthResult = await c.env.DB.prepare(
-      "SELECT COALESCE(SUM(cashback_generated), 0) as total FROM company_purchases WHERE strftime('%Y-%m', purchase_date) = ?"
-    ).bind(thisMonth).first();
-    const cashbackThisMonth = (cashbackThisMonthResult?.total as number) || 0;
-
-    // Recent purchases (last 10) with simplified query
-    const recentPurchasesResult = await c.env.DB.prepare(`
-      SELECT 
-        cp.id,
-        cp.purchase_value,
-        cp.cashback_generated,
-        cp.purchase_date,
-        cp.customer_coupon as customer_cpf
-      FROM company_purchases cp
-      ORDER BY cp.created_at DESC
-      LIMIT 10
-    `).all();
-
-    // Enhance with company names separately
-    const enhancedPurchases = [];
-    for (const purchase of recentPurchasesResult.results as any[]) {
-      // Get company name
-      const company = await c.env.DB.prepare(
-        "SELECT nome_fantasia FROM companies WHERE id = (SELECT company_id FROM company_purchases WHERE id = ?)"
-      ).bind(purchase.id).first();
-      
+    const { data: recent } = await supabase
+      .from('company_purchases')
+      .select('id, company_id, purchase_value, cashback_generated, purchase_date, customer_coupon')
+      .order('created_at', { ascending: false })
+      .limit(10);
+    const enhancedPurchases = [] as any[];
+    for (const p of recent || []) {
+      let companyName = 'Empresa Desconhecida';
+      const { data: company } = await supabase
+        .from('companies')
+        .select('nome_fantasia')
+        .eq('id', p.company_id)
+        .single();
+      if (company) companyName = (company as any).nome_fantasia || companyName;
       enhancedPurchases.push({
-        ...purchase,
-        company_name: company?.nome_fantasia || 'Empresa Desconhecida'
+        id: p.id,
+        company_name: companyName,
+        customer_cpf: p.customer_coupon,
+        purchase_value: p.purchase_value,
+        cashback_generated: p.cashback_generated,
+        purchase_date: p.purchase_date
       });
     }
 
@@ -160,121 +158,89 @@ adminApi.get("/api/admin/dashboard/stats", requireAdminAuth, async (c) => {
 // Dashboard charts data - FIXED: Simplified for Cloudflare D1
 adminApi.get("/api/admin/dashboard/charts", requireAdminAuth, async (c) => {
   try {
-    // Get monthly purchase data separately (simplified query)
-    const monthlyPurchaseData = await c.env.DB.prepare(`
-      SELECT 
-        strftime('%Y-%m', purchase_date) as month_key,
-        strftime('%m', purchase_date) as month_num,
-        COUNT(id) as purchases,
-        COALESCE(SUM(cashback_generated), 0) as cashback,
-        COUNT(DISTINCT company_id) as companies
-      FROM company_purchases
-      WHERE purchase_date >= date('now', '-6 months')
-      GROUP BY strftime('%Y-%m', purchase_date)
-      ORDER BY month_key ASC
-      LIMIT 6
-    `).all();
+    const supabase = createSupabaseClient(c);
+    const start = new Date();
+    start.setMonth(start.getMonth() - 6);
+    const startStr = start.toISOString().split('T')[0];
+    const { data: purchases } = await supabase
+      .from('company_purchases')
+      .select('purchase_date, cashback_generated, company_id')
+      .gte('purchase_date', startStr);
+    const { data: affiliates } = await supabase
+      .from('affiliates')
+      .select('created_at')
+      .gte('created_at', startStr);
 
-    // Get affiliate signup data separately 
-    const monthlyAffiliateData = await c.env.DB.prepare(`
-      SELECT 
-        strftime('%Y-%m', created_at) as month_key,
-        COUNT(id) as affiliates
-      FROM affiliates
-      WHERE created_at >= date('now', '-6 months')
-      GROUP BY strftime('%Y-%m', created_at)
-      ORDER BY month_key ASC
-    `).all();
-
-    // Merge the data
     const monthNames = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
-    const monthlyStatsMap = new Map();
-    
-    // Initialize with purchase data
-    for (const row of monthlyPurchaseData.results as any[]) {
-      monthlyStatsMap.set(row.month_key, {
-        month: monthNames[parseInt(row.month_num) - 1],
-        purchases: row.purchases,
-        cashback: row.cashback,
-        companies: row.companies,
-        affiliates: 0 // default
-      });
+    const monthlyStatsMap = new Map<string, { month: string; purchases: number; cashback: number; companies: number; affiliates: number }>();
+    const companiesPerMonth = new Map<string, Set<number>>();
+    for (const p of purchases || []) {
+      const key = String(p.purchase_date).slice(0, 7);
+      const monthNum = parseInt(key.split('-')[1]);
+      const current = monthlyStatsMap.get(key) || { month: monthNames[monthNum - 1], purchases: 0, cashback: 0, companies: 0, affiliates: 0 };
+      current.purchases += 1;
+      current.cashback += Number(p.cashback_generated || 0);
+      monthlyStatsMap.set(key, current);
+      const set = companiesPerMonth.get(key) || new Set<number>();
+      set.add(p.company_id as number);
+      companiesPerMonth.set(key, set);
     }
-    
-    // Add affiliate data
-    for (const row of monthlyAffiliateData.results as any[]) {
-      const existing = monthlyStatsMap.get(row.month_key);
-      if (existing) {
-        existing.affiliates = row.affiliates;
-      }
+    for (const [key, set] of companiesPerMonth.entries()) {
+      const curr = monthlyStatsMap.get(key);
+      if (curr) curr.companies = set.size;
     }
-
+    for (const a of affiliates || []) {
+      const key = String(a.created_at).slice(0, 7);
+      const curr = monthlyStatsMap.get(key);
+      if (curr) curr.affiliates += 1;
+    }
     const formattedMonthlyStats = Array.from(monthlyStatsMap.values());
 
-    // Get current counts for status distribution
-    const totalAffiliates = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM affiliates WHERE is_active = 1"
-    ).first();
-    
-    const totalCompanies = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM companies WHERE is_active = 1"
-    ).first();
-    
-    const pendingWithdrawals = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM withdrawals WHERE status = 'pending'"
-    ).first();
+    const { count: totalAff } = await supabase
+      .from('affiliates')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_active', true);
+    const { count: totalComp } = await supabase
+      .from('companies')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_active', true);
+    const { data: pendWd } = await supabase
+      .from('withdrawals')
+      .select('status')
+      .eq('status', 'pending');
 
     const statusDistribution = [
-      { 
-        name: 'Afiliados Ativos', 
-        value: (totalAffiliates?.count as number) || 0, 
-        color: '#10b981' 
-      },
-      { 
-        name: 'Empresas Ativas', 
-        value: (totalCompanies?.count as number) || 0, 
-        color: '#3b82f6' 
-      },
-      { 
-        name: 'Saques Pendentes', 
-        value: (pendingWithdrawals?.count as number) || 0, 
-        color: '#f59e0b' 
-      }
+      { name: 'Afiliados Ativos', value: totalAff || 0, color: '#10b981' },
+      { name: 'Empresas Ativas', value: totalComp || 0, color: '#3b82f6' },
+      { name: 'Saques Pendentes', value: (pendWd || []).length, color: '#f59e0b' }
     ];
 
-    // Weekly growth data (simplified) - get data for last 7 days
-    const weeklyGrowthData = [];
+    const weeklyGrowthData = [] as any[];
     const dayNames = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
-    
     for (let i = 6; i >= 0; i--) {
-      // Get day info
-      const dateStr = `date('now', '-${i} days')`;
-      
-      // Get affiliate signups for this day
-      const affiliateCount = await c.env.DB.prepare(`
-        SELECT COUNT(*) as count FROM affiliates WHERE date(created_at) = ${dateStr}
-      `).first();
-      
-      // Get company signups for this day
-      const companyCount = await c.env.DB.prepare(`
-        SELECT COUNT(*) as count FROM companies WHERE date(created_at) = ${dateStr}
-      `).first();
-      
-      // Get purchases for this day
-      const purchaseCount = await c.env.DB.prepare(`
-        SELECT COUNT(*) as count FROM company_purchases WHERE purchase_date = ${dateStr}
-      `).first();
-
-      // Get day name
-      const dayNum = await c.env.DB.prepare(`
-        SELECT strftime('%w', ${dateStr}) as day_num
-      `).first();
-      
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const dayStr = d.toISOString().split('T')[0];
+      const nextDayStr = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).toISOString().split('T')[0];
+      const { count: affCount } = await supabase
+        .from('affiliates')
+        .select('*', { count: 'exact', head: true })
+        .gte('created_at', dayStr)
+        .lt('created_at', nextDayStr);
+      const { count: compCount } = await supabase
+        .from('companies')
+        .select('*', { count: 'exact', head: true })
+        .gte('created_at', dayStr)
+        .lt('created_at', nextDayStr);
+      const { count: purchCount } = await supabase
+        .from('company_purchases')
+        .select('*', { count: 'exact', head: true })
+        .eq('purchase_date', dayStr);
       weeklyGrowthData.push({
-        day: dayNames[parseInt((dayNum as any)?.day_num || '0')],
-        newAffiliates: (affiliateCount?.count as number) || 0,
-        newCompanies: (companyCount?.count as number) || 0,
-        totalPurchases: (purchaseCount?.count as number) || 0
+        day: dayNames[d.getDay()],
+        newAffiliates: affCount || 0,
+        newCompanies: compCount || 0,
+        totalPurchases: purchCount || 0
       });
     }
 
@@ -297,55 +263,39 @@ adminApi.get("/api/admin/withdrawals", requireAdminAuth, async (c) => {
     const page = parseInt(c.req.query("page") || "1");
     const limit = parseInt(c.req.query("limit") || "20");
     const offset = (page - 1) * limit;
+    const supabase = createSupabaseClient(c);
 
-    const withdrawals = await c.env.DB.prepare(`
-      SELECT w.*, up.mocha_user_id
-      FROM withdrawals w
-      JOIN user_profiles up ON w.user_id = up.id
-      WHERE w.status = ?
-      ORDER BY w.created_at DESC
-      LIMIT ? OFFSET ?
-    `).bind(status, limit, offset).all();
+    let query = supabase
+      .from('withdrawals')
+      .select('id, amount_requested, fee_amount, net_amount, status, pix_key, created_at, affiliate_id, affiliates!inner(full_name,cpf,email)', { count: 'exact' })
+      .eq('status', status)
+      .order('created_at', { ascending: false });
 
-    // Enhance with affiliate info separately to avoid complex JOINs
-    const enhancedWithdrawals = [];
-    for (const withdrawal of withdrawals.results as any[]) {
-      // Extract affiliate ID from mocha_user_id (format: affiliate_123)
-      const affiliateId = withdrawal.mocha_user_id?.replace('affiliate_', '');
-      if (affiliateId && !isNaN(parseInt(affiliateId))) {
-        const affiliate = await c.env.DB.prepare(
-          "SELECT full_name, cpf, email FROM affiliates WHERE id = ?"
-        ).bind(parseInt(affiliateId)).first();
-        
-        enhancedWithdrawals.push({
-          ...withdrawal,
-          full_name: affiliate?.full_name || 'N/A',
-          cpf: affiliate?.cpf || 'N/A',
-          email: affiliate?.email || 'N/A'
-        });
-      } else {
-        enhancedWithdrawals.push({
-          ...withdrawal,
-          full_name: 'N/A',
-          cpf: 'N/A',
-          email: 'N/A'
-        });
-      }
+    const { data: rows, error: listError, count: totalCountValue } = await query.range(offset, offset + limit - 1);
+    if (listError) {
+      return c.json({ error: 'Erro interno do servidor' }, 500);
     }
 
-    const totalCount = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM withdrawals WHERE status = ?"
-    ).bind(status).first();
-
-    const totalCountValue = (totalCount?.count as number) || 0;
+    const enhancedWithdrawals = (rows || []).map((w: any) => ({
+      id: w.id,
+      amount_requested: Number(w.amount_requested || 0),
+      fee_amount: Number(w.fee_amount || 0),
+      net_amount: Number(w.net_amount || 0),
+      status: w.status,
+      pix_key: w.pix_key || '',
+      created_at: w.created_at,
+      full_name: w.affiliates?.full_name || 'N/A',
+      cpf: w.affiliates?.cpf || 'N/A',
+      email: w.affiliates?.email || 'N/A'
+    }));
 
     return c.json({
       withdrawals: enhancedWithdrawals,
       pagination: {
         page,
         limit,
-        total: totalCountValue,
-        totalPages: Math.ceil(totalCountValue / limit)
+        total: totalCountValue || 0,
+        totalPages: Math.ceil((totalCountValue || 0) / limit)
       }
     });
 
@@ -363,114 +313,185 @@ const UpdateWithdrawalSchema = z.object({
 
 adminApi.patch("/api/admin/withdrawals/:id", requireAdminAuth, async (c) => {
   try {
-    const withdrawalId = c.req.param("id");
+    const withdrawalId = Number(c.req.param("id"));
     const body = await c.req.json();
     const validation = UpdateWithdrawalSchema.safeParse(body);
-    
     if (!validation.success) {
-      return c.json({ 
-        error: "Dados inválidos", 
-        details: validation.error.errors 
-      }, 400);
+      return c.json({ error: "Dados inválidos", details: validation.error.errors }, 400);
     }
-
     const { status, notes } = validation.data;
     const adminUser: any = (c as any).get("adminUser");
+    const supabase = createSupabaseClient(c);
 
-    // Get withdrawal details
-    const withdrawal = await c.env.DB.prepare(
-      "SELECT * FROM withdrawals WHERE id = ?"
-    ).bind(withdrawalId).first();
-
+    const { data: withdrawal } = await supabase
+      .from('withdrawals')
+      .select('*')
+      .eq('id', withdrawalId)
+      .single();
     if (!withdrawal) {
       return c.json({ error: "Saque não encontrado" }, 404);
     }
-
-    if (withdrawal.status !== "pending") {
+    if ((withdrawal as any).status !== 'pending') {
       return c.json({ error: "Saque já foi processado" }, 400);
     }
 
-    // Update withdrawal
-    await c.env.DB.prepare(`
-      UPDATE withdrawals 
-      SET status = ?, processed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).bind(status, withdrawalId).run();
-
-    // If approved, update user balance
-    if (status === "approved") {
-      await c.env.DB.prepare(`
-        UPDATE user_settings 
-        SET available_balance = available_balance - ?, updated_at = CURRENT_TIMESTAMP
-        WHERE user_id = ?
-      `).bind(withdrawal.net_amount, withdrawal.user_id).run();
-    } else {
-      // If rejected, return frozen balance to available
-      await c.env.DB.prepare(`
-        UPDATE user_settings 
-        SET available_balance = available_balance + ?, 
-            frozen_balance = frozen_balance - ?,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE user_id = ?
-      `).bind(withdrawal.net_amount, withdrawal.net_amount, withdrawal.user_id).run();
+    const { error: updateError } = await supabase
+      .from('withdrawals')
+      .update({ status, processed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', withdrawalId);
+    if (updateError) {
+      return c.json({ error: 'Erro interno do servidor' }, 500);
     }
 
-    // Log action
-    await c.env.DB.prepare(`
-      INSERT INTO admin_audit_logs (admin_user_id, action, entity_type, entity_id, old_data, new_data)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      adminUser.admin_user_id,
-      status === "approved" ? "APPROVE_WITHDRAWAL" : "REJECT_WITHDRAWAL",
-      "withdrawal",
-      withdrawalId,
-      JSON.stringify({ status: withdrawal.status }),
-      JSON.stringify({ status, notes })
-    ).run();
+    await supabase
+      .from('admin_audit_logs')
+      .insert({
+        admin_user_id: (adminUser as any).admin_user_id,
+        action: status === 'approved' ? 'APPROVE_WITHDRAWAL' : 'REJECT_WITHDRAWAL',
+        entity_type: 'withdrawal',
+        entity_id: withdrawalId,
+        old_data: JSON.stringify({ status: (withdrawal as any).status }),
+        new_data: JSON.stringify({ status, notes })
+      });
 
-    return c.json({ success: true, message: `Saque ${status === "approved" ? "aprovado" : "rejeitado"} com sucesso` });
-
+    return c.json({ success: true, message: `Saque ${status === 'approved' ? 'aprovado' : 'rejeitado'} com sucesso` });
   } catch (error) {
     console.error("Update withdrawal error:", error);
     return c.json({ error: "Erro interno do servidor" }, 500);
   }
 });
 
+adminApi.get("/api/admin/reports/companies", requireAdminAuth, async (c) => {
+  try {
+    const supabase = createSupabaseClient(c);
+    const { data, error } = await supabase
+      .from('companies')
+      .select('id,nome_fantasia')
+      .order('nome_fantasia', { ascending: true });
+    if (error) {
+      return c.json({ error: 'Erro interno do servidor' }, 500);
+    }
+    return c.json({ companies: data || [] });
+  } catch (error) {
+    console.error('Get report companies error:', error);
+    return c.json({ error: 'Erro interno do servidor' }, 500);
+  }
+});
+
+adminApi.get("/api/admin/reports/purchases", requireAdminAuth, async (c) => {
+  try {
+    const companyId = c.req.query('companyId');
+    const range = c.req.query('range') || '7';
+    const start = c.req.query('start');
+    const end = c.req.query('end');
+    const page = parseInt(c.req.query('page') || '1');
+    const limit = parseInt(c.req.query('limit') || '20');
+    const offset = (page - 1) * limit;
+    const supabase = createSupabaseClient(c);
+
+    let fromDate: string | null = null;
+    let toDate: string | null = null;
+    const today = new Date();
+    const dateISO = (d: Date) => d.toISOString().split('T')[0];
+
+    if (range === 'today') {
+      fromDate = dateISO(today);
+      toDate = dateISO(today);
+    } else if (range === 'yesterday') {
+      const y = new Date(today);
+      y.setDate(y.getDate() - 1);
+      fromDate = dateISO(y);
+      toDate = dateISO(y);
+    } else if (range === '7' || range === '15' || range === '30') {
+      const days = parseInt(range);
+      const startD = new Date(today);
+      startD.setDate(startD.getDate() - days + 1);
+      fromDate = dateISO(startD);
+      toDate = dateISO(today);
+    } else if (range === 'custom' && start && end) {
+      fromDate = start;
+      toDate = end;
+    }
+
+    let query = supabase
+      .from('company_purchases')
+      .select('id, company_id, purchase_value, cashback_generated, purchase_date, customer_coupon, companies!inner(nome_fantasia)', { count: 'exact' })
+      .order('purchase_date', { ascending: false });
+
+    if (companyId) {
+      query = query.eq('company_id', Number(companyId));
+    }
+    if (fromDate) {
+      query = query.gte('purchase_date', fromDate);
+    }
+    if (toDate) {
+      query = query.lte('purchase_date', toDate);
+    }
+
+    const { data: rows, error: listError, count } = await query.range(offset, offset + limit - 1);
+    if (listError) {
+      return c.json({ error: 'Erro interno do servidor' }, 500);
+    }
+
+    let sumQuery = supabase
+      .from('company_purchases')
+      .select('sum(purchase_value), sum(cashback_generated)')
+      .order('purchase_date', { ascending: false });
+    if (companyId) {
+      sumQuery = sumQuery.eq('company_id', Number(companyId));
+    }
+    if (fromDate) {
+      sumQuery = sumQuery.gte('purchase_date', fromDate);
+    }
+    if (toDate) {
+      sumQuery = sumQuery.lte('purchase_date', toDate);
+    }
+    const { data: sumRow } = await sumQuery.single();
+
+    return c.json({
+      purchases: rows || [],
+      totals: {
+        total_purchase_value: (sumRow as any)?.sum?.purchase_value || 0,
+        total_cashback_generated: (sumRow as any)?.sum?.cashback_generated || 0
+      },
+      pagination: {
+        page,
+        limit,
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Get report purchases error:', error);
+    return c.json({ error: 'Erro interno do servidor' }, 500);
+  }
+});
+
 // Get global affiliates statistics
 adminApi.get("/api/admin/affiliates/stats", requireAdminAuth, async (c) => {
   try {
-    // Total active affiliates
-    const activeResult = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM affiliates WHERE is_active = 1"
-    ).first();
-    const totalActive = (activeResult?.count as number) || 0;
-
-    // Total inactive affiliates
-    const inactiveResult = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM affiliates WHERE is_active = 0"
-    ).first();
-    const totalInactive = (inactiveResult?.count as number) || 0;
-
-    // Total cashback generated by all affiliates - simplified query
-    const cashbackResult = await c.env.DB.prepare(`
-      SELECT COALESCE(SUM(cashback_generated), 0) as total
-      FROM company_purchases
-    `).first();
-    const totalCashbackGenerated = (cashbackResult?.total as number) || 0;
-
-    // Total pending commissions (70% of cashback goes to network)
+    const supabase = createSupabaseClient(c);
+    const { count: totalActive } = await supabase
+      .from('affiliates')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_active', true);
+    const { count: totalInactive } = await supabase
+      .from('affiliates')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_active', false);
+    const { data: cbRows } = await supabase
+      .from('company_purchases')
+      .select('cashback_generated');
+    const totalCashbackGenerated = (cbRows || []).reduce((sum: number, r: any) => sum + Number(r.cashback_generated || 0), 0);
     const totalCommissionsPending = totalCashbackGenerated * 0.70;
-
-    // New affiliates this month
     const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const thisMonth = `${year}-${month}`;
-    
-    const newAffiliatesResult = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM affiliates WHERE strftime('%Y-%m', created_at) = ?"
-    ).bind(thisMonth).first();
-    const newAffiliatesThisMonth = (newAffiliatesResult?.count as number) || 0;
+    const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+    const nextMonthStart = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString().split('T')[0];
+    const { count: newAffiliatesThisMonth } = await supabase
+      .from('affiliates')
+      .select('*', { count: 'exact', head: true })
+      .gte('created_at', monthStart)
+      .lt('created_at', nextMonthStart);
 
     return c.json({
       totalActive,
@@ -493,97 +514,55 @@ adminApi.get("/api/admin/affiliates", requireAdminAuth, async (c) => {
     const limit = parseInt(c.req.query("limit") || "20");
     const search = c.req.query("search") || "";
     const offset = (page - 1) * limit;
-
-    console.log(`[ADMIN_API] Fetching affiliates - page: ${page}, limit: ${limit}, search: "${search}"`);
-
-    // First, check total count
-    let countQuery = "SELECT COUNT(*) as count FROM affiliates WHERE 1 = 1";
-    const countParams = [];
+    const supabase = createSupabaseClient(c);
+    let query = supabase
+      .from('affiliates')
+      .select('id, full_name, email, cpf, phone, referral_code, sponsor_id, is_active, is_verified, created_at, last_access_at', { count: 'exact' })
+      .order('created_at', { ascending: false });
     if (search) {
-      countQuery += ` AND (full_name LIKE ? OR email LIKE ? OR cpf LIKE ?)`;
-      countParams.push(`%${search}%`, `%${search}%`, `%${search}%`);
+      const term = `%${search}%`;
+      query = query.or(`full_name.ilike.${term},email.ilike.${term},cpf.ilike.${term}`);
     }
-
-    const totalCountResult = await c.env.DB.prepare(countQuery).bind(...countParams).first();
-    const totalCountValue = (totalCountResult?.count as number) || 0;
-    console.log(`[ADMIN_API] Total affiliates in DB: ${totalCountValue}`);
-
-    // If no affiliates, return empty result
-    if (totalCountValue === 0) {
-      return c.json({
-        affiliates: [],
-        pagination: {
-          page: 1,
-          limit,
-          total: 0,
-          totalPages: 0
-        }
-      });
-    }
-
-    // Get affiliates with basic info
-    let query = `
-      SELECT 
-        a.id, a.full_name, a.email, a.cpf, a.whatsapp, a.referral_code,
-        a.sponsor_id, a.is_active, a.is_verified, a.created_at, a.last_access_at
-      FROM affiliates a
-      WHERE 1 = 1
-    `;
-
-    const params = [];
-    if (search) {
-      query += ` AND (a.full_name LIKE ? OR a.email LIKE ? OR a.cpf LIKE ?)`;
-      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
-    }
-
-    query += ` ORDER BY a.created_at DESC LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
-
-    console.log(`[ADMIN_API] Query: ${query}`);
-    const affiliatesResult = await c.env.DB.prepare(query).bind(...params).all();
-    const affiliates = affiliatesResult.results || [];
-    console.log(`[ADMIN_API] Found ${affiliates.length} affiliates`);
-
-    // Calculate additional fields efficiently with separate simple queries
-    const enrichedAffiliates = [];
-    for (const affiliate of affiliates) {
-      const affiliateId = (affiliate as any).id;
-      
-      // Count direct referrals
-      const directReferralsResult = await c.env.DB.prepare(
-        "SELECT COUNT(*) as count FROM affiliates WHERE sponsor_id = ?"
-      ).bind(affiliateId).first();
-      const directReferrals = (directReferralsResult?.count as number) || 0;
-
-      // Calculate total cashback - simplified to avoid complex JOINs
-      const affiliateCpf = (affiliate as any).cpf;
+    const { data: rows, count: totalCountValue } = await query.range(offset, offset + limit - 1);
+    const affiliates = rows || [];
+    const enrichedAffiliates = [] as any[];
+    for (const a of affiliates) {
+      const { count: directReferrals } = await supabase
+        .from('affiliates')
+        .select('*', { count: 'exact', head: true })
+        .eq('sponsor_id', (a as any).id);
       let totalCashback = 0;
-      if (affiliateCpf) {
-        const totalCashbackResult = await c.env.DB.prepare(`
-          SELECT COALESCE(SUM(cashback_generated), 0) as total
-          FROM company_purchases
-          WHERE customer_coupon = ?
-        `).bind(affiliateCpf).first();
-        totalCashback = (totalCashbackResult?.total as number) || 0;
+      if ((a as any).cpf) {
+        const { data: cbRows } = await supabase
+          .from('company_purchases')
+          .select('cashback_generated')
+          .eq('customer_coupon', (a as any).cpf);
+        totalCashback = (cbRows || []).reduce((sum: number, r: any) => sum + Number(r.cashback_generated || 0), 0);
       }
-
       enrichedAffiliates.push({
-        ...(affiliate as any),
-        direct_referrals: directReferrals,
+        id: (a as any).id,
+        full_name: (a as any).full_name,
+        email: (a as any).email,
+        cpf: (a as any).cpf,
+        whatsapp: (a as any).phone || null,
+        referral_code: (a as any).referral_code,
+        sponsor_id: (a as any).sponsor_id,
+        is_active: Boolean((a as any).is_active),
+        is_verified: Boolean((a as any).is_verified),
+        created_at: (a as any).created_at,
+        last_access_at: (a as any).last_access_at || null,
+        direct_referrals: directReferrals || 0,
         total_cashback: totalCashback,
-        pending_commissions: totalCashback * 0.7 // 70% of generated cashback as pending commissions
+        pending_commissions: totalCashback * 0.7
       });
     }
-
-    console.log(`[ADMIN_API] Returning ${enrichedAffiliates.length} enriched affiliates`);
-
     return c.json({
       affiliates: enrichedAffiliates,
       pagination: {
         page,
         limit,
-        total: totalCountValue,
-        totalPages: Math.ceil(totalCountValue / limit)
+        total: totalCountValue || 0,
+        totalPages: Math.ceil((totalCountValue || 0) / limit)
       }
     });
 
@@ -619,48 +598,47 @@ adminApi.patch("/api/admin/affiliates/:id", requireAdminAuth, async (c) => {
 
     const { full_name, email, whatsapp } = validation.data;
     const adminUser: any = (c as any).get("adminUser");
-
-    // Get current affiliate
-    const affiliate = await c.env.DB.prepare(
-      "SELECT * FROM affiliates WHERE id = ?"
-    ).bind(affiliateId).first();
+    const supabase = createSupabaseClient(c);
+    const { data: affiliate } = await supabase
+      .from('affiliates')
+      .select('*')
+      .eq('id', Number(affiliateId))
+      .single();
 
     if (!affiliate) {
       return c.json({ error: "Afiliado não encontrado" }, 404);
     }
 
     // Check if email is already in use by another affiliate
-    const emailCheck = await c.env.DB.prepare(
-      "SELECT id FROM affiliates WHERE email = ? AND id != ?"
-    ).bind(email, affiliateId).first();
+    const { data: emailCheck } = await supabase
+      .from('affiliates')
+      .select('id')
+      .eq('email', email)
+      .neq('id', Number(affiliateId))
+      .single();
 
     if (emailCheck) {
       return c.json({ error: "Email já está em uso por outro afiliado" }, 409);
     }
 
     // Update affiliate
-    await c.env.DB.prepare(`
-      UPDATE affiliates 
-      SET full_name = ?, email = ?, whatsapp = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).bind(full_name, email, whatsapp || null, affiliateId).run();
+    const { error: updateError } = await supabase
+      .from('affiliates')
+      .update({ full_name, email, phone: whatsapp || null, updated_at: new Date().toISOString() })
+      .eq('id', Number(affiliateId));
+    if (updateError) {
+      return c.json({ error: 'Erro interno do servidor' }, 500);
+    }
 
     // Log action
-    await c.env.DB.prepare(`
-      INSERT INTO admin_audit_logs (admin_user_id, action, entity_type, entity_id, old_data, new_data)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      adminUser.admin_user_id,
-      "UPDATE_AFFILIATE",
-      "affiliate",
-      affiliateId,
-      JSON.stringify({ 
-        full_name: affiliate.full_name, 
-        email: affiliate.email, 
-        whatsapp: affiliate.whatsapp 
-      }),
-      JSON.stringify({ full_name, email, whatsapp })
-    ).run();
+    await supabase
+      .from('admin_audit_logs')
+      .insert({
+        admin_user_id: (adminUser as any).admin_user_id,
+        action: 'UPDATE_AFFILIATE',
+        entity_type: 'affiliate',
+        entity_id: Number(affiliateId)
+      });
 
     return c.json({ 
       success: true, 
@@ -678,11 +656,12 @@ adminApi.patch("/api/admin/affiliates/:id/toggle-status", requireAdminAuth, asyn
   try {
     const affiliateId = c.req.param("id");
     const adminUser: any = (c as any).get("adminUser");
-
-    // Get current affiliate
-    const affiliate = await c.env.DB.prepare(
-      "SELECT * FROM affiliates WHERE id = ?"
-    ).bind(affiliateId).first();
+    const supabase = createSupabaseClient(c);
+    const { data: affiliate } = await supabase
+      .from('affiliates')
+      .select('*')
+      .eq('id', Number(affiliateId))
+      .single();
 
     if (!affiliate) {
       return c.json({ error: "Afiliado não encontrado" }, 404);
@@ -690,23 +669,23 @@ adminApi.patch("/api/admin/affiliates/:id/toggle-status", requireAdminAuth, asyn
 
     const newStatus = !affiliate.is_active;
 
-    // Update status
-    await c.env.DB.prepare(
-      "UPDATE affiliates SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-    ).bind(newStatus, affiliateId).run();
+    const { error: updateError } = await supabase
+      .from('affiliates')
+      .update({ is_active: newStatus, updated_at: new Date().toISOString() })
+      .eq('id', Number(affiliateId));
+    if (updateError) {
+      return c.json({ error: 'Erro interno do servidor' }, 500);
+    }
 
     // Log action
-    await c.env.DB.prepare(`
-      INSERT INTO admin_audit_logs (admin_user_id, action, entity_type, entity_id, old_data, new_data)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      adminUser.admin_user_id,
-      newStatus ? "ACTIVATE_AFFILIATE" : "DEACTIVATE_AFFILIATE",
-      "affiliate",
-      affiliateId,
-      JSON.stringify({ is_active: affiliate.is_active }),
-      JSON.stringify({ is_active: newStatus })
-    ).run();
+    await supabase
+      .from('admin_audit_logs')
+      .insert({
+        admin_user_id: (adminUser as any).admin_user_id,
+        action: newStatus ? 'ACTIVATE_AFFILIATE' : 'DEACTIVATE_AFFILIATE',
+        entity_type: 'affiliate',
+        entity_id: Number(affiliateId)
+      });
 
     return c.json({ 
       success: true, 
@@ -725,59 +704,57 @@ adminApi.delete("/api/admin/affiliates/:id", requireAdminAuth, async (c) => {
   try {
     const affiliateId = c.req.param("id");
     const adminUser: any = (c as any).get("adminUser");
-
-    // Get current affiliate
-    const affiliate = await c.env.DB.prepare(
-      "SELECT * FROM affiliates WHERE id = ?"
-    ).bind(affiliateId).first();
+    const supabase = createSupabaseClient(c);
+    const { data: affiliate } = await supabase
+      .from('affiliates')
+      .select('*')
+      .eq('id', Number(affiliateId))
+      .single();
 
     if (!affiliate) {
       return c.json({ error: "Afiliado não encontrado" }, 404);
     }
 
     // Check if affiliate has dependent records
-    const hasDownline = await c.env.DB.prepare(
-      "SELECT COUNT(*) as count FROM affiliates WHERE sponsor_id = ?"
-    ).bind(affiliateId).first();
+    const { count: downline } = await supabase
+      .from('affiliates')
+      .select('*', { count: 'exact', head: true })
+      .eq('sponsor_id', Number(affiliateId));
 
-    if (hasDownline && (hasDownline.count as number) > 0) {
+    if ((downline || 0) > 0) {
       return c.json({ 
         error: "Não é possível excluir afiliado que possui indicados na rede" 
       }, 400);
     }
 
-    // Delete affiliate sessions first
-    await c.env.DB.prepare(
-      "DELETE FROM affiliate_sessions WHERE affiliate_id = ?"
-    ).bind(affiliateId).run();
+    await supabase
+      .from('affiliate_sessions')
+      .delete()
+      .eq('affiliate_id', Number(affiliateId));
 
-    // Delete password reset tokens
-    await c.env.DB.prepare(
-      "DELETE FROM affiliate_password_reset_tokens WHERE affiliate_id = ?"
-    ).bind(affiliateId).run();
+    await supabase
+      .from('affiliate_password_reset_tokens')
+      .delete()
+      .eq('affiliate_id', Number(affiliateId));
 
-    // Update customer_coupons to remove affiliate_id reference
-    await c.env.DB.prepare(
-      "UPDATE customer_coupons SET affiliate_id = NULL WHERE affiliate_id = ?"
-    ).bind(affiliateId).run();
+    await supabase
+      .from('customer_coupons')
+      .update({ affiliate_id: null })
+      .eq('affiliate_id', Number(affiliateId));
 
-    // Delete affiliate
-    await c.env.DB.prepare(
-      "DELETE FROM affiliates WHERE id = ?"
-    ).bind(affiliateId).run();
+    await supabase
+      .from('affiliates')
+      .delete()
+      .eq('id', Number(affiliateId));
 
-    // Log action
-    await c.env.DB.prepare(`
-      INSERT INTO admin_audit_logs (admin_user_id, action, entity_type, entity_id, old_data, new_data)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      adminUser.admin_user_id,
-      "DELETE_AFFILIATE",
-      "affiliate",
-      affiliateId,
-      JSON.stringify(affiliate),
-      JSON.stringify({ deleted: true })
-    ).run();
+    await supabase
+      .from('admin_audit_logs')
+      .insert({
+        admin_user_id: (adminUser as any).admin_user_id,
+        action: 'DELETE_AFFILIATE',
+        entity_type: 'affiliate',
+        entity_id: Number(affiliateId)
+      });
 
     return c.json({ 
       success: true, 
@@ -798,65 +775,60 @@ adminApi.get("/api/admin/companies", requireAdminAuth, async (c) => {
     const search = c.req.query("search") || "";
     const offset = (page - 1) * limit;
 
-    let query = `
-      SELECT c.*
-      FROM companies c
-      WHERE 1 = 1
-    `;
+    const supabase = createSupabaseClient(c);
 
-    const params = [];
+    let select = supabase
+      .from('companies')
+      .select('id,nome_fantasia,razao_social,cnpj,email,telefone,responsavel,is_active,created_at', { count: 'exact' })
+      .order('created_at', { ascending: false });
+
     if (search) {
-      query += ` AND (c.nome_fantasia LIKE ? OR c.razao_social LIKE ? OR c.cnpj LIKE ?)`;
-      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+      select = select.or(`nome_fantasia.ilike.%${search}%,razao_social.ilike.%${search}%,cnpj.ilike.%${search}%,email.ilike.%${search}%`);
     }
 
-    query += ` ORDER BY c.created_at DESC LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
+    const { data: companies, error: listError, count } = await select.range(offset, offset + limit - 1);
+    if (listError) {
+      return c.json({ error: 'Erro interno do servidor' }, 500);
+    }
 
-    const companiesResult = await c.env.DB.prepare(query).bind(...params).all();
-    const companies = companiesResult.results || [];
-
-    // Enhance with additional data using separate queries
-    const enhancedCompanies = [];
-    for (const company of companies) {
+    const enhancedCompanies: Array<any> = [];
+    for (const company of companies || []) {
       const companyId = (company as any).id;
-      
-      // Get cashback config
-      const cashbackConfig = await c.env.DB.prepare(
-        "SELECT cashback_percentage FROM company_cashback_config WHERE company_id = ?"
-      ).bind(companyId).first();
-      
-      // Get purchase stats
-      const purchaseStats = await c.env.DB.prepare(
-        "SELECT COUNT(*) as total_purchases, COALESCE(SUM(cashback_generated), 0) as total_cashback_generated FROM company_purchases WHERE company_id = ?"
-      ).bind(companyId).first();
+
+      const { data: cashbackConfig } = await supabase
+        .from('company_cashback_config')
+        .select('cashback_percentage')
+        .eq('company_id', companyId)
+        .single();
+
+      const { count: totalPurchases } = await supabase
+        .from('company_purchases')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', companyId);
+
+      const { data: sumRow } = await supabase
+        .from('company_purchases')
+        .select('sum(cashback_generated)')
+        .eq('company_id', companyId)
+        .single();
 
       enhancedCompanies.push({
-        ...(company as any),
-        cashback_percentage: cashbackConfig?.cashback_percentage || 5.0,
-        total_purchases: (purchaseStats?.total_purchases as number) || 0,
-        total_cashback_generated: (purchaseStats?.total_cashback_generated as number) || 0
+        ...company,
+        cashback_percentage: (cashbackConfig as any)?.cashback_percentage ?? 5.0,
+        total_purchases: totalPurchases || 0,
+        total_cashback_generated: (sumRow as any)?.sum ?? 0
       });
     }
 
-    // Get total count for pagination
-    let countQuery = "SELECT COUNT(*) as count FROM companies WHERE 1 = 1";
-    const countParams = [];
-    if (search) {
-      countQuery += ` AND (nome_fantasia LIKE ? OR razao_social LIKE ? OR cnpj LIKE ?)`;
-      countParams.push(`%${search}%`, `%${search}%`, `%${search}%`);
-    }
-
-    const totalCount = await c.env.DB.prepare(countQuery).bind(...countParams).first();
-    const totalCountValue = (totalCount?.count as number) || 0;
+    const total = count || 0;
 
     return c.json({
       companies: enhancedCompanies,
       pagination: {
         page,
         limit,
-        total: totalCountValue,
-        totalPages: Math.ceil(totalCountValue / limit)
+        total,
+        totalPages: Math.ceil(total / limit)
       }
     });
 
@@ -866,40 +838,93 @@ adminApi.get("/api/admin/companies", requireAdminAuth, async (c) => {
   }
 });
 
-// Toggle company status
+adminApi.get("/api/admin/companies/:id", requireAdminAuth, async (c) => {
+  try {
+    const companyId = Number(c.req.param("id"));
+    const supabase = createSupabaseClient(c);
+
+    const { data: company, error: companyError } = await supabase
+      .from('companies')
+      .select('id,nome_fantasia,razao_social,cnpj,email,telefone,responsavel,is_active,created_at')
+      .eq('id', companyId)
+      .single();
+    if (companyError || !company) {
+      return c.json({ error: 'Empresa não encontrada' }, 404);
+    }
+
+    const { data: cashbackConfig } = await supabase
+      .from('company_cashback_config')
+      .select('cashback_percentage')
+      .eq('company_id', companyId)
+      .single();
+
+    const { count: totalPurchases } = await supabase
+      .from('company_purchases')
+      .select('id', { count: 'exact', head: true })
+      .eq('company_id', companyId);
+
+    const { data: sumRow } = await supabase
+      .from('company_purchases')
+      .select('sum(cashback_generated), sum(purchase_value)')
+      .eq('company_id', companyId)
+      .single();
+
+    const { data: recentPurchases } = await supabase
+      .from('company_purchases')
+      .select('id,purchase_value,cashback_generated,purchase_date,customer_coupon')
+      .eq('company_id', companyId)
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    return c.json({
+      company,
+      metrics: {
+        cashback_percentage: (cashbackConfig as any)?.cashback_percentage ?? 5.0,
+        total_purchases: totalPurchases || 0,
+        total_cashback_generated: (sumRow as any)?.sum ?? 0,
+        total_purchase_value: (sumRow as any)?.sum ?? 0
+      },
+      recentPurchases: recentPurchases || []
+    });
+  } catch (error) {
+    console.error('Get company details error:', error);
+    return c.json({ error: 'Erro interno do servidor' }, 500);
+  }
+});
+
+// Toggle company status (Supabase)
 adminApi.patch("/api/admin/companies/:id/toggle-status", requireAdminAuth, async (c) => {
   try {
     const companyId = c.req.param("id");
     const adminUser: any = (c as any).get("adminUser");
-
-    // Get current company
-    const company = await c.env.DB.prepare(
-      "SELECT * FROM companies WHERE id = ?"
-    ).bind(companyId).first();
+    const supabase = createSupabaseClient(c);
+    const { data: company } = await supabase
+      .from('companies')
+      .select('*')
+      .eq('id', Number(companyId))
+      .single();
 
     if (!company) {
       return c.json({ error: "Empresa não encontrada" }, 404);
     }
 
-    const newStatus = !company.is_active;
+    const newStatus = !Boolean((company as any).is_active);
+    const { error: updateError } = await supabase
+      .from('companies')
+      .update({ is_active: newStatus, updated_at: new Date().toISOString() })
+      .eq('id', Number(companyId));
+    if (updateError) {
+      return c.json({ error: 'Erro interno do servidor' }, 500);
+    }
 
-    // Update status
-    await c.env.DB.prepare(
-      "UPDATE companies SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-    ).bind(newStatus, companyId).run();
-
-    // Log action
-    await c.env.DB.prepare(`
-      INSERT INTO admin_audit_logs (admin_user_id, action, entity_type, entity_id, old_data, new_data)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(
-      adminUser.admin_user_id,
-      newStatus ? "ACTIVATE_COMPANY" : "DEACTIVATE_COMPANY",
-      "company",
-      companyId,
-      JSON.stringify({ is_active: company.is_active }),
-      JSON.stringify({ is_active: newStatus })
-    ).run();
+    await supabase
+      .from('admin_audit_logs')
+      .insert({
+        admin_user_id: (adminUser as any).admin_user_id,
+        action: newStatus ? 'ACTIVATE_COMPANY' : 'DEACTIVATE_COMPANY',
+        entity_type: 'company',
+        entity_id: Number(companyId)
+      });
 
     return c.json({ 
       success: true, 
@@ -916,16 +941,15 @@ adminApi.patch("/api/admin/companies/:id/toggle-status", requireAdminAuth, async
 // Get commission settings
 adminApi.get("/api/admin/commission-settings", requireAdminAuth, async (c) => {
   try {
-    const settings = await c.env.DB.prepare(`
-      SELECT level, percentage, is_active 
-      FROM system_commission_settings 
-      ORDER BY level ASC
-    `).all();
-
-    return c.json({
-      settings: settings.results || []
-    });
-
+    const supabase = createSupabaseClient(c);
+    const { data: settings, error } = await supabase
+      .from('system_commission_settings')
+      .select('level, percentage, is_active')
+      .order('level', { ascending: true });
+    if (error) {
+      return c.json({ error: "Erro interno do servidor" }, 500);
+    }
+    return c.json({ settings: settings || [] });
   } catch (error) {
     console.error("Get commission settings error:", error);
     return c.json({ error: "Erro interno do servidor" }, 500);
@@ -970,31 +994,23 @@ adminApi.put("/api/admin/commission-settings", requireAdminAuth, async (c) => {
       }, 400);
     }
 
-    // Update each level
+    const supabase = createSupabaseClient(c);
     for (const setting of settings) {
-      await c.env.DB.prepare(`
-        UPDATE system_commission_settings 
-        SET percentage = ?, updated_at = datetime('now')
-        WHERE level = ?
-      `).bind(setting.percentage, setting.level).run();
+      await supabase
+        .from('system_commission_settings')
+        .update({ percentage: setting.percentage, updated_at: new Date().toISOString() })
+        .eq('level', setting.level);
     }
-
-    // Log action
-    await c.env.DB.prepare(`
-      INSERT INTO admin_audit_logs (admin_user_id, action, entity_type, entity_id, new_data)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(
-      adminUser.admin_user_id,
-      "UPDATE_COMMISSION_SETTINGS",
-      "system_settings",
-      0,
-      JSON.stringify(settings)
-    ).run();
-
-    return c.json({ 
-      success: true, 
-      message: "Configurações de comissão atualizadas com sucesso" 
-    });
+    await supabase
+      .from('admin_audit_logs')
+      .insert({
+        admin_user_id: (adminUser as any).admin_user_id,
+        action: 'UPDATE_COMMISSION_SETTINGS',
+        entity_type: 'system_settings',
+        entity_id: 0,
+        new_data: JSON.stringify(settings)
+      });
+    return c.json({ success: true, message: "Configurações de comissão atualizadas com sucesso" });
 
   } catch (error) {
     console.error("Update commission settings error:", error);

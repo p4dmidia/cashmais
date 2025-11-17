@@ -145,6 +145,49 @@ app.post("/api/affiliate/register", zValidator("json", AffiliateRegisterSchema),
     }
 
     const mochaUserId = `affiliate_${Math.random().toString(36).substring(2, 10)}`;
+
+    async function getLegPreferenceForSponsor(sponsorAffiliateId: number): Promise<string> {
+      const { data: profile } = await supabase
+        .from('user_profiles')
+        .select('id')
+        .eq('mocha_user_id', `affiliate_${sponsorAffiliateId}`)
+        .single();
+      if (!profile) return 'automatic';
+      const { data: settings } = await supabase
+        .from('user_settings')
+        .select('leg_preference')
+        .eq('user_id', profile.id)
+        .single();
+      const pref = settings?.leg_preference || 'automatic';
+      return pref;
+    }
+
+    async function getChildren(affiliateId: number): Promise<any[]> {
+      const { data } = await supabase
+        .from('affiliates')
+        .select('id, created_at')
+        .eq('sponsor_id', affiliateId)
+        .eq('is_active', true)
+        .order('created_at', { ascending: true });
+      return data || [];
+    }
+
+    async function determinePlacementParent(sponsorAffiliateId: number): Promise<number> {
+      const pref = await getLegPreferenceForSponsor(sponsorAffiliateId);
+      const rootChildren = await getChildren(sponsorAffiliateId);
+      if ((rootChildren?.length || 0) < 3) return sponsorAffiliateId;
+      let order = rootChildren;
+      if (pref === 'right') order = [...rootChildren].reverse();
+      if (pref === 'center' && rootChildren.length >= 3) order = [rootChildren[1], rootChildren[0], rootChildren[2]];
+      const queue: number[] = order.map(c => c.id);
+      while (queue.length > 0) {
+        const nodeId = queue.shift() as number;
+        const children = await getChildren(nodeId);
+        if ((children?.length || 0) < 3) return nodeId;
+        for (const ch of children) queue.push(ch.id);
+      }
+      return sponsorAffiliateId;
+    }
     const { data: newProfile, error: profileCreateError } = await supabase
       .from('user_profiles')
       .insert({
@@ -188,6 +231,8 @@ app.post("/api/affiliate/register", zValidator("json", AffiliateRegisterSchema),
       return c.json({ error: "Erro ao criar configurações" }, 500);
     }
 
+    const placementParentId = sponsorId ? await determinePlacementParent(sponsorId) : null;
+    
     // Create affiliate in Supabase (primary store for network and dashboards)
     const { data: supAffiliate, error: supAffError } = await supabase
       .from('affiliates')
@@ -198,7 +243,7 @@ app.post("/api/affiliate/register", zValidator("json", AffiliateRegisterSchema),
         phone: cleanWhatsapp || null,
         password_hash: passwordHash,
         referral_code: referralCode,
-        sponsor_id: sponsorId || null,
+        sponsor_id: placementParentId || sponsorId || null,
         is_active: true,
         is_verified: true
       })

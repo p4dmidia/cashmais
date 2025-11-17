@@ -14,6 +14,7 @@ import {
   Shield,
   Settings
 } from 'lucide-react';
+import { Printer } from 'lucide-react';
 
 interface Withdrawal {
   id: number;
@@ -182,6 +183,13 @@ export default function WithdrawalsManagement() {
             >
               <Building2 className="mr-3 h-5 w-5 text-gray-400" />
               Empresas
+            </Link>
+            <Link
+              to="/admin/reports"
+              className="group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-all duration-200 text-gray-300 hover:bg-white/5 hover:text-white"
+            >
+              <Printer className="mr-3 h-5 w-5 text-gray-400" />
+              Relatórios
             </Link>
             <Link
               to="/admin/settings"

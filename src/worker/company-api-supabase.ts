@@ -3,6 +3,7 @@ import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { createClient } from '@supabase/supabase-js'
+import { distributeNetworkCommissions as distributeNetworkCommissionsSupabase } from '../lib/supabase-commission'
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -72,7 +73,7 @@ async function getCashierSession(c: any) {
     .from('cashier_sessions')
     .select(`
       *,
-      company_cashiers!inner(*, companies!inner(nome_fantasia))
+      company_cashiers!inner(*, companies!inner(id, nome_fantasia))
     `)
     .eq('session_token', sessionToken)
     .gt('expires_at', new Date().toISOString())
@@ -406,27 +407,37 @@ app.post('/api/empresa/caixas', async (c) => {
     const { name, cpf, password } = CreateCashierSchema.parse(await c.req.json());
     const supabase = createSupabaseClient(c);
 
-    // Check if CPF already exists for this company
+    const cleanCpf = cpf.replace(/\D/g, '');
+    // Check if CPF already exists for this company (normalize CPF)
     const { data: existingCashier } = await supabase
       .from('company_cashiers')
       .select('id')
       .eq('company_id', session.companies.id)
-      .eq('cpf', cpf)
+      .eq('cpf', cleanCpf)
       .single();
     
     if (existingCashier) {
       return c.json({ error: 'CPF já cadastrado para esta empresa' }, 400);
     }
 
+    // Prevent CPF already linked to another company
+    const { data: globalExisting } = await supabase
+      .from('company_cashiers')
+      .select('id, company_id')
+      .eq('cpf', cleanCpf)
+      .single();
+    if (globalExisting && globalExisting.company_id !== session.companies.id) {
+      return c.json({ error: 'CPF já vinculado a outra empresa' }, 409);
+    }
+
     // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const cleanCpf = cpf.replace(/\D/g, '');
+    
     let { data: userProfile } = await supabase
       .from('user_profiles')
       .select('id')
       .eq('cpf', cleanCpf)
-      .eq('role', 'cashier')
       .single();
 
     if (!userProfile) {
@@ -442,7 +453,7 @@ app.post('/api/empresa/caixas', async (c) => {
         .single();
       if (profileError || !createdProfile) {
         console.error('User profile creation error:', profileError);
-        return c.json({ error: 'Erro interno do servidor' }, 500);
+        return c.json({ error: 'Erro interno do servidor', detail: String(profileError?.message || profileError) }, 500);
       }
       userProfile = createdProfile;
     }
@@ -461,7 +472,7 @@ app.post('/api/empresa/caixas', async (c) => {
 
     if (cashierError) {
       console.error('Cashier creation error:', cashierError);
-      return c.json({ error: 'Erro interno do servidor' }, 500);
+      return c.json({ error: 'Erro interno do servidor', detail: String(cashierError?.message || cashierError) }, 500);
     }
 
     return c.json({ success: true, message: 'Caixa cadastrado com sucesso!' });
@@ -531,7 +542,7 @@ app.post('/api/caixa/compra', async (c) => {
     let customerData = customer;
 
     // If not found in affiliates, try user_profiles
-    if (!customer && !customerError) {
+    if (!customer) {
       const { data: userData, error: userError } = await supabase
         .from('user_profiles')
         .select('id, cpf, mocha_user_id, is_active')
@@ -558,7 +569,7 @@ app.post('/api/caixa/compra', async (c) => {
     const { data: config } = await supabase
       .from('company_cashback_config')
       .select('cashback_percentage')
-      .eq('company_id', session.companies.id)
+      .eq('company_id', session.company_cashiers.company_id)
       .single();
 
     const cashbackPercentage = config?.cashback_percentage || 5.0;
@@ -568,43 +579,35 @@ app.post('/api/caixa/compra', async (c) => {
     let { data: customerCouponData } = await supabase
       .from('customer_coupons')
       .select('*')
-      .eq('cpf', cleanCpf)
-      .eq('is_active', true)
+      .eq('coupon_code', cleanCpf)
       .single();
 
     if (!customerCouponData) {
-      // Create customer coupon using CPF
       let userIdForCoupon = customerData.id;
-      
       if (customerType === 'affiliate') {
-        // For affiliates, find the corresponding user_profiles.id
         const { data: userProfile } = await supabase
           .from('user_profiles')
           .select('id')
           .eq('mocha_user_id', `affiliate_${customerData.id}`)
           .single();
-        
         if (userProfile) {
           userIdForCoupon = userProfile.id;
         } else {
-          // If no user_profile exists, create one
           const { data: newProfile } = await supabase
             .from('user_profiles')
-            .insert({
+            .upsert({
               mocha_user_id: `affiliate_${customerData.id}`,
               cpf: customerData.cpf,
               role: 'affiliate',
               is_active: true
-            })
+            }, { onConflict: 'mocha_user_id' })
             .select()
             .single();
-          
           if (newProfile) {
             userIdForCoupon = newProfile.id;
           }
         }
       }
-      
       const { data: newCoupon } = await supabase
         .from('customer_coupons')
         .insert({
@@ -616,15 +619,22 @@ app.post('/api/caixa/compra', async (c) => {
         })
         .select()
         .single();
-      
       customerCouponData = newCoupon;
+    } else if (!customerCouponData.is_active) {
+      const { data: activated } = await supabase
+        .from('customer_coupons')
+        .update({ is_active: true })
+        .eq('id', customerCouponData.id)
+        .select()
+        .single();
+      customerCouponData = activated || customerCouponData;
     }
 
     // Record purchase
     const { data: purchase, error: purchaseError } = await supabase
       .from('company_purchases')
       .insert({
-        company_id: session.companies.id,
+        company_id: session.company_cashiers.company_id,
         cashier_id: session.company_cashiers.id,
         customer_coupon_id: customerCouponData.id,
         customer_coupon: cleanCpf,
@@ -640,7 +650,7 @@ app.post('/api/caixa/compra', async (c) => {
 
     if (purchaseError) {
       console.error('Record purchase error:', purchaseError);
-      return c.json({ error: 'Erro interno do servidor' }, 500);
+      return c.json({ error: 'Erro interno do servidor', detail: JSON.stringify(purchaseError) }, 500);
     }
 
     // Update coupon usage
@@ -654,6 +664,18 @@ app.post('/api/caixa/compra', async (c) => {
 
     if (couponError) {
       console.error('Coupon usage update error:', couponError);
+    }
+
+    // Distribute network commissions when customer is affiliate
+    if (customerType === 'affiliate') {
+      try {
+        await distributeNetworkCommissionsSupabase(
+          (purchase as any).id as number,
+          (customerData as any).id as number,
+          'affiliate',
+          cashbackGenerated
+        );
+      } catch (e) {}
     }
 
     // Calculate actual commission that will be credited to customer (if affiliate)
@@ -720,33 +742,31 @@ app.get('/api/empresa/estatisticas', async (c) => {
   try {
     const supabase = createSupabaseClient(c);
     const currentDate = new Date();
-    const currentMonth = `${currentDate.getFullYear()}-${(currentDate.getMonth() + 1).toString().padStart(2, '0')}`;
-    
-    // Total statistics (all time)
-    const { data: totalStats, error: totalError } = await supabase
-      .from('company_purchases')
-      .select(`
-        count(),
-        sum(purchase_value),
-        sum(cashback_generated)
-      `)
-      .eq('company_id', session.companies.id)
-      .single();
+    const monthStart = `${currentDate.getFullYear()}-${(currentDate.getMonth() + 1).toString().padStart(2, '0')}-01`;
+    const nextMonthStart = new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 1).toISOString().split('T')[0];
 
-    // Monthly statistics (current month)
-    const { data: monthlyStats, error: monthlyError } = await supabase
+    const { data: allRows } = await supabase
       .from('company_purchases')
-      .select(`
-        count(),
-        sum(purchase_value),
-        sum(cashback_generated)
-      `)
-      .eq('company_id', session.companies.id)
-      .gte('purchase_date', `${currentMonth}-01`)
-      .lt('purchase_date', new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 1).toISOString().split('T')[0])
-      .single();
+      .select('purchase_value, cashback_generated, purchase_date')
+      .eq('company_id', session.companies.id);
 
-    // Get current cashback percentage
+    const total = (allRows || []).reduce((acc: any, row: any) => {
+      acc.sales_count += 1;
+      acc.sales_value += Number(row.purchase_value || 0);
+      acc.cashback_generated += Number(row.cashback_generated || 0);
+      return acc;
+    }, { sales_count: 0, sales_value: 0, cashback_generated: 0 });
+
+    const monthly = (allRows || []).reduce((acc: any, row: any) => {
+      const d = String(row.purchase_date || '');
+      if (d >= monthStart && d < nextMonthStart) {
+        acc.sales_count += 1;
+        acc.sales_value += Number(row.purchase_value || 0);
+        acc.cashback_generated += Number(row.cashback_generated || 0);
+      }
+      return acc;
+    }, { sales_count: 0, sales_value: 0, cashback_generated: 0 });
+
     const { data: cashbackConfig } = await supabase
       .from('company_cashback_config')
       .select('cashback_percentage')
@@ -754,16 +774,8 @@ app.get('/api/empresa/estatisticas', async (c) => {
       .single();
 
     return c.json({
-      total: {
-        sales_count: totalStats?.count || 0,
-        sales_value: totalStats?.sum?.purchase_value || 0,
-        cashback_generated: totalStats?.sum?.cashback_generated || 0
-      },
-      monthly: {
-        sales_count: monthlyStats?.count || 0,
-        sales_value: monthlyStats?.sum?.purchase_value || 0,
-        cashback_generated: monthlyStats?.sum?.cashback_generated || 0
-      },
+      total,
+      monthly,
       cashback_percentage: cashbackConfig?.cashback_percentage || 5.0
     });
   } catch (error: any) {
@@ -782,36 +794,39 @@ app.get('/api/empresa/dados-mensais', async (c) => {
   try {
     const supabase = createSupabaseClient(c);
     
-    // Get last 6 months of data
-    const { data: monthlyData, error } = await supabase
+    const startDate = new Date();
+    startDate.setMonth(startDate.getMonth() - 6);
+    const startStr = startDate.toISOString().split('T')[0];
+
+    const { data: rows, error } = await supabase
       .from('company_purchases')
-      .select(`
-        purchase_date,
-        count(),
-        sum(purchase_value),
-        sum(cashback_generated)
-      `)
+      .select('purchase_date, purchase_value, cashback_generated')
       .eq('company_id', session.companies.id)
-      .gte('purchase_date', new Date(Date.now() - 6 * 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0])
+      .gte('purchase_date', startStr)
       .order('purchase_date', { ascending: true });
 
     if (error) {
-      console.error('Get monthly data error:', error);
-      return c.json({ error: 'Erro interno do servidor' }, 500);
+      return c.json({ error: 'Erro interno do servidor', detail: String(error.message || error) }, 500);
     }
 
-    // Format the data for better display
-    const formattedData = (monthlyData || []).map(row => ({
-      month: new Date(row.purchase_date + '-01').toLocaleDateString('pt-BR', { month: 'short', year: '2-digit' }),
-      sales_count: row.count,
-      sales_value: row.sum?.purchase_value || 0,
-      cashback_generated: row.sum?.cashback_generated || 0
+    const agg = new Map<string, { sales_count: number; sales_value: number; cashback_generated: number }>();
+    for (const row of rows || []) {
+      const monthKey = String(row.purchase_date).slice(0, 7); // YYYY-MM
+      const current = agg.get(monthKey) || { sales_count: 0, sales_value: 0, cashback_generated: 0 };
+      current.sales_count += 1;
+      current.sales_value += Number(row.purchase_value || 0);
+      current.cashback_generated += Number(row.cashback_generated || 0);
+      agg.set(monthKey, current);
+    }
+    const formattedData = Array.from(agg.entries()).map(([month, v]) => ({
+      month: new Date(month + '-01').toLocaleDateString('pt-BR', { month: 'short', year: '2-digit' }),
+      sales_count: v.sales_count,
+      sales_value: v.sales_value,
+      cashback_generated: v.cashback_generated
     }));
-
     return c.json({ monthly_data: formattedData });
   } catch (error: any) {
-    console.error('Get monthly data error:', error);
-    return c.json({ error: 'Erro interno do servidor' }, 500);
+    return c.json({ error: 'Erro interno do servidor', detail: String(error.message || error) }, 500);
   }
 });
 
@@ -846,8 +861,8 @@ app.put('/api/empresa/caixas/:id', async (c) => {
 
     if (password && password.length >= 6) {
       const passwordHash = await bcrypt.hash(password, 10);
-      updateData.name = name;
       updateData.password_hash = passwordHash;
+      if (name) updateData.name = name;
     } else if (name) {
       updateData.name = name;
     }

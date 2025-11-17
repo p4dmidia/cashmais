@@ -28,6 +28,7 @@ import WithdrawalsManagement from '@/react-app/pages/admin/WithdrawalsManagement
 import AffiliatesManagement from '@/react-app/pages/admin/AffiliatesManagement';
 import CompaniesManagement from '@/react-app/pages/admin/CompaniesManagement';
 import SystemSettings from '@/react-app/pages/admin/SystemSettings';
+import Reports from '@/react-app/pages/admin/Reports';
 
 function App() {
   return (
@@ -73,6 +74,7 @@ function App() {
           <Route path="/admin/withdrawals" element={<WithdrawalsManagement />} />
           <Route path="/admin/affiliates" element={<AffiliatesManagement />} />
           <Route path="/admin/companies" element={<CompaniesManagement />} />
+          <Route path="/admin/reports" element={<Reports />} />
           <Route path="/admin/settings" element={<SystemSettings />} />
         </Routes>
       </div>

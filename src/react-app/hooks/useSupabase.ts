@@ -71,13 +71,13 @@ export function useSupabaseTransactions(userId: string | null) {
   return { transactions, loading, error }
 }
 
-export function useAffiliateBalance(userId: string | null) {
+export function useAffiliateBalance(affiliateId: string | null) {
   const [balance, setBalance] = useState<{available_balance: number, total_earned: number}>({available_balance: 0, total_earned: 0})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
 
   useEffect(() => {
-    if (!userId) {
+    if (!affiliateId) {
       setLoading(false)
       return
     }
@@ -85,10 +85,23 @@ export function useAffiliateBalance(userId: string | null) {
     const fetchBalance = async () => {
       try {
         setLoading(true)
+        const mochaUserId = `affiliate_${affiliateId}`
+        const { data: profile } = await supabase
+          .from('user_profiles')
+          .select('id')
+          .eq('mocha_user_id', mochaUserId)
+          .single()
+
+        if (!profile) {
+          setBalance({ available_balance: 0, total_earned: 0 })
+          setLoading(false)
+          return
+        }
+
         const { data, error } = await supabase
           .from('user_settings')
           .select('available_balance, total_earnings')
-          .eq('user_id', userId)
+          .eq('user_id', profile.id)
           .single()
 
         if (error) throw error
@@ -109,13 +122,13 @@ export function useAffiliateBalance(userId: string | null) {
   return { balance, loading, error }
 }
 
-export function useAffiliateTransactions(userId: string | null, limit?: number) {
+export function useAffiliateTransactions(userCpf: string | null, limit?: number) {
   const [transactions, setTransactions] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
 
   useEffect(() => {
-    if (!userId) {
+    if (!userCpf) {
       setLoading(false)
       return
     }
@@ -124,10 +137,10 @@ export function useAffiliateTransactions(userId: string | null, limit?: number) 
       try {
         setLoading(true)
         let query = supabase
-          .from('transactions')
-          .select('*')
-          .eq('user_id', userId)
-          .order('created_at', { ascending: false })
+          .from('company_purchases')
+          .select('company_id, purchase_value, cashback_generated, purchase_date, purchase_time')
+          .eq('customer_coupon', userCpf)
+          .order('purchase_date', { ascending: false })
         
         if (limit) {
           query = query.limit(limit)
@@ -136,7 +149,13 @@ export function useAffiliateTransactions(userId: string | null, limit?: number) 
         const { data, error } = await query
 
         if (error) throw error
-        setTransactions(data || [])
+        const mapped = (data || []).map((row: any) => ({
+          company_name: '',
+          transaction_date: row.purchase_date,
+          purchase_value: row.purchase_value,
+          cashback_value: row.cashback_generated
+        }))
+        setTransactions(mapped)
       } catch (err) {
         setError(err as Error)
       } finally {
@@ -145,18 +164,18 @@ export function useAffiliateTransactions(userId: string | null, limit?: number) 
     }
 
     fetchTransactions()
-  }, [userId, limit])
+  }, [userCpf, limit])
 
   return { transactions, loading, error }
 }
 
-export function useNetworkMembers(userId: string | null) {
+export function useNetworkMembers(affiliateId: string | null) {
   const [members, setMembers] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
 
   useEffect(() => {
-    if (!userId) {
+    if (!affiliateId) {
       setLoading(false)
       return
     }
@@ -166,8 +185,8 @@ export function useNetworkMembers(userId: string | null) {
         setLoading(true)
         const { data, error } = await supabase
           .from('affiliates')
-          .select('*')
-          .eq('sponsor_referral_code', userId)
+          .select('id, cpf, email, full_name, created_at')
+          .eq('sponsor_id', Number(affiliateId))
 
         if (error) throw error
         setMembers(data || [])
@@ -179,7 +198,12 @@ export function useNetworkMembers(userId: string | null) {
     }
 
     fetchMembers()
-  }, [userId])
+  }, [affiliateId])
 
-  return { network: members, members, loading, error }
+  const network = {
+    level1: members,
+    level2: [],
+    level3: []
+  }
+  return { network, members, loading, error }
 }

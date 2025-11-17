@@ -15,7 +15,8 @@ import {
   CreditCard,
   LayoutDashboard,
   Shield,
-  Settings
+  Settings,
+  Printer
 } from 'lucide-react';
 
 interface Company {
@@ -51,6 +52,9 @@ export default function CompaniesManagement() {
   const [search, setSearch] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [toggleLoading, setToggleLoading] = useState<number | null>(null);
+  const [viewLoading, setViewLoading] = useState(false);
+  const [viewOpen, setViewOpen] = useState(false);
+  const [viewData, setViewData] = useState<any | null>(null);
 
   useEffect(() => {
     fetchCompanies();
@@ -113,6 +117,28 @@ export default function CompaniesManagement() {
     setPagination(prev => ({ ...prev, page: 1 }));
   };
 
+  const handleViewCompany = async (companyId: number) => {
+    setViewLoading(true);
+    try {
+      const response = await fetch(`/api/admin/companies/${companyId}`, {
+        credentials: 'include',
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setViewData(data);
+        setViewOpen(true);
+      } else {
+        const err = await response.json();
+        alert(err.error || 'Erro ao carregar detalhes');
+      }
+    } catch (error) {
+      console.error('Failed to view company:', error);
+      alert('Erro de conexão');
+    } finally {
+      setViewLoading(false);
+    }
+  };
+
   const formatCurrency = (value: number) => {
     return new Intl.NumberFormat('pt-BR', {
       style: 'currency',
@@ -133,6 +159,7 @@ export default function CompaniesManagement() {
   };
 
   return (
+    <>
     <div className="min-h-screen bg-gradient-to-br from-[#001144] to-[#000011]">
       {/* Sidebar */}
       <div className="fixed inset-y-0 left-0 z-50 w-64 bg-black/20 backdrop-blur-xl border-r border-white/10">
@@ -174,6 +201,13 @@ export default function CompaniesManagement() {
             >
               <Building2 className="mr-3 h-5 w-5 text-green-400" />
               Empresas
+            </Link>
+            <Link
+              to="/admin/reports"
+              className="group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-all duration-200 text-gray-300 hover:bg-white/5 hover:text-white"
+            >
+              <Printer className="mr-3 h-5 w-5 text-gray-400" />
+              Relatórios
             </Link>
             <Link
               to="/admin/settings"
@@ -321,7 +355,7 @@ export default function CompaniesManagement() {
                         </td>
                         <td className="py-3">
                           <div className="flex items-center space-x-2">
-                            <button
+                          <button
                               onClick={() => handleToggleStatus(company.id, company.is_active)}
                               disabled={toggleLoading === company.id}
                               className={`${
@@ -338,7 +372,11 @@ export default function CompaniesManagement() {
                                 <CheckCircle className="h-3 w-3" />
                               )}
                             </button>
-                            <button className="bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 border border-blue-500/30 px-3 py-1 rounded-lg text-xs font-medium transition-all duration-200">
+                            <button
+                              onClick={() => handleViewCompany(company.id)}
+                              disabled={viewLoading}
+                              className="bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 border border-blue-500/30 px-3 py-1 rounded-lg text-xs font-medium transition-all duration-200 disabled:opacity-50"
+                            >
                               <Eye className="h-3 w-3" />
                             </button>
                           </div>
@@ -379,5 +417,99 @@ export default function CompaniesManagement() {
         </div>
       </div>
     </div>
+    {viewOpen && viewData && (
+      <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center">
+        <div className="w-full max-w-2xl bg-black/80 border border-white/10 rounded-xl p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-xl font-semibold text-white">Detalhes da Empresa</h3>
+            <button
+              onClick={() => { setViewOpen(false); setViewData(null); }}
+              className="text-gray-400 hover:text-white"
+            >
+              <XCircle className="h-5 w-5" />
+            </button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-1">
+              <div className="text-sm text-gray-400">Nome Fantasia</div>
+              <div className="text-white text-sm">{viewData.company.nome_fantasia}</div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-sm text-gray-400">Razão Social</div>
+              <div className="text-white text-sm">{viewData.company.razao_social}</div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-sm text-gray-400">CNPJ</div>
+              <div className="text-white text-sm font-mono">{formatCNPJ(viewData.company.cnpj)}</div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-sm text-gray-400">Email</div>
+              <div className="text-white text-sm">{viewData.company.email}</div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-sm text-gray-400">Responsável</div>
+              <div className="text-white text-sm">{viewData.company.responsavel}</div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-sm text-gray-400">Telefone</div>
+              <div className="text-white text-sm">{viewData.company.telefone}</div>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-6">
+            <div className="bg-white/5 border border-white/10 rounded-lg p-4">
+              <div className="text-sm text-gray-400">Cashback</div>
+              <div className="flex items-center space-x-1 mt-1">
+                <Percent className="h-4 w-4 text-green-400" />
+                <span className="text-green-400 text-sm font-medium">{viewData.metrics.cashback_percentage}%</span>
+              </div>
+            </div>
+            <div className="bg-white/5 border border-white/10 rounded-lg p-4">
+              <div className="text-sm text-gray-400">Compras</div>
+              <div className="flex items-center space-x-1 mt-1">
+                <ShoppingCart className="h-4 w-4 text-blue-400" />
+                <span className="text-white text-sm font-medium">{viewData.metrics.total_purchases}</span>
+              </div>
+            </div>
+            <div className="bg-white/5 border border-white/10 rounded-lg p-4">
+              <div className="text-sm text-gray-400">Total Gerado</div>
+              <div className="flex items-center space-x-1 mt-1">
+                <DollarSign className="h-4 w-4 text-green-400" />
+                <span className="text-green-400 text-sm font-medium">{formatCurrency(viewData.metrics.total_cashback_generated)}</span>
+              </div>
+            </div>
+          </div>
+          <div className="mt-6">
+            <div className="text-sm text-gray-400 mb-2">Compras Recentes</div>
+            {viewData.recentPurchases.length === 0 ? (
+              <div className="text-gray-400 text-sm">Sem compras recentes</div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-white/10">
+                      <th className="text-left text-xs font-medium text-gray-400 pb-2">Data</th>
+                      <th className="text-left text-xs font-medium text-gray-400 pb-2">Valor</th>
+                      <th className="text-left text-xs font-medium text-gray-400 pb-2">Cashback</th>
+                      <th className="text-left text-xs font-medium text-gray-400 pb-2">Cupom</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {viewData.recentPurchases.map((p: any) => (
+                      <tr key={p.id} className="border-b border-white/5">
+                        <td className="py-2 text-sm text-white">{new Date(p.purchase_date).toLocaleDateString('pt-BR')}</td>
+                        <td className="py-2 text-sm text-white">{formatCurrency(p.purchase_value || 0)}</td>
+                        <td className="py-2 text-sm text-green-400">{formatCurrency(p.cashback_generated || 0)}</td>
+                        <td className="py-2 text-sm text-gray-300 font-mono">{p.customer_coupon || '-'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   );
 }
