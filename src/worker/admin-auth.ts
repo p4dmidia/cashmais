@@ -3,7 +3,6 @@ import { getCookie, setCookie } from "hono/cookie";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { createClient } from '@supabase/supabase-js'
-import { createClient } from '@supabase/supabase-js'
 
 const adminAuth = new Hono<{ Bindings: Env }>();
 

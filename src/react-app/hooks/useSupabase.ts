@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabase'
-import { UserProfile } from '../shared/types'
+import { UserProfile } from '@/shared/types'
 
 export function useSupabaseProfile(userId: string | null) {
   const [profile, setProfile] = useState<UserProfile | null>(null)
@@ -32,7 +32,7 @@ export function useSupabaseProfile(userId: string | null) {
     }
 
     fetchProfile()
-  }, [userId])
+  }, [affiliateId])
 
   return { profile, loading, error }
 }
@@ -66,7 +66,7 @@ export function useSupabaseTransactions(userId: string | null) {
     }
 
     fetchTransactions()
-  }, [userId])
+  }, [affiliateId])
 
   return { transactions, loading, error }
 }
@@ -117,7 +117,7 @@ export function useAffiliateBalance(affiliateId: string | null) {
     }
 
     fetchBalance()
-  }, [userId])
+  }, [affiliateId])
 
   return { balance, loading, error }
 }

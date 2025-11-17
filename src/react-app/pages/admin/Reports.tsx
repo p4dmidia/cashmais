@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router';
 import {
   LayoutDashboard,
@@ -8,7 +8,6 @@ import {
   CreditCard,
   Settings,
   Calendar,
-  Filter,
   FileDown,
   Printer,
   CheckSquare
